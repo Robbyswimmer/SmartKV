@@ -1,178 +1,186 @@
 # SmartKV: Attention-Guided Adaptive Precision for KV-Cache Compression
 
-> "Allocate precision where the model looks"
+SmartKV is a research implementation exploring KV-cache compression through attention-guided adaptive precision allocation. The system dynamically assigns bit-widths (2, 3, 4, or 8 bits) to cached key-value pairs based on their importance in attention patterns, aiming to achieve better accuracy-memory tradeoffs than uniform quantization approaches.
 
-SmartKV is a novel KV-cache compression method that dynamically allocates precision based on attention patterns. By assigning higher bit-widths to tokens that receive more attention, SmartKV achieves better accuracy-memory tradeoffs than uniform quantization methods.
+## Core Concept
 
-## 🎯 Key Innovation
+While uniform quantization methods apply the same bit-width to all tokens in the KV-cache, SmartKV allocates precision adaptively based on attention patterns. Tokens that receive higher attention scores are assigned higher precision, while less important tokens are compressed more aggressively. This approach is motivated by the observation that attention patterns are often sparse, with models focusing on a small subset of critical tokens.
 
-Current KV-cache quantization methods treat all tokens uniformly, but attention patterns reveal that models focus on a small subset of "critical" tokens. SmartKV tracks attention patterns online and allocates 2-8 bit precision accordingly, achieving **40-60% memory reduction** compared to INT8 baseline while maintaining accuracy.
+## Algorithm Overview
 
-## 🚀 Quick Start
+SmartKV operates in three phases:
 
-### Installation
+1. **Importance Tracking**: Maintains exponential moving average of attention scores for each token across layers
+2. **Precision Allocation**: Every N tokens, performs greedy allocation of available bit-widths to maximize importance coverage within a memory budget
+3. **Quantization**: Applies per-tensor symmetric quantization with allocated precision levels
+
+Key parameters:
+- `memory_budget`: Target memory usage as fraction of FP16 baseline (e.g., 0.35 = 35%)
+- `decay`: EMA decay factor for importance tracking (default: 0.9)
+- `realloc_freq`: Frequency of precision reallocation in tokens (default: 16)
+- `available_bits`: Supported quantization levels (default: [2, 3, 4, 8])
+
+## Installation
 
 ```bash
-# Clone the repository
+# Clone repository
 git clone https://github.com/yourusername/SmartKV.git
 cd SmartKV
 
 # Create virtual environment
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 ```
 
-### Basic Usage
+## Current Implementation Status
+
+**Completed:**
+- Core quantization infrastructure (2/3/4/8-bit symmetric quantization)
+- Importance tracking system with EMA-based scoring
+- Greedy precision allocation algorithm
+- Llama model integration (tested with Llama 3.1 8B, TinyLlama 1.1B)
+- Basic evaluation pipeline with latency and output quality metrics
+
+**In Progress:**
+- Comprehensive evaluation against uniform quantization baselines
+- Perplexity-based quality assessment
+
+**Planned:**
+- GPU optimization (current implementation is CPU-only)
+- Additional model architectures (Mistral, GPT-NeoX)
+- Integration with standard benchmarks (LongBench, RULER)
+
+## Usage Example
 
 ```python
-from smartkv import SmartKVCache
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from smartkv.models.llama_smartkv import LlamaSmartKV, SmartKVConfig
+import torch
 
 # Load model
-model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf")
-tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+model_name = "NousResearch/Meta-Llama-3.1-8B"
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float32
+)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 # Configure SmartKV
-# (Integration code will be added in Phase 7)
-
-# Generate with SmartKV
-prompt = "Your prompt here..."
-output = model.generate(
-    tokenizer(prompt, return_tensors="pt").input_ids,
-    max_length=512
+config = SmartKVConfig(
+    enabled=True,
+    memory_budget=0.35,  # 35% of FP16 memory
+    decay=0.9,
+    realloc_freq=16,
+    available_bits=[2, 3, 4, 8],
+    device="cpu"
 )
+
+# Wrap model with SmartKV
+smartkv_model = LlamaSmartKV(model, config)
+
+# Generate text
+inputs = tokenizer("Your prompt here", return_tensors="pt")
+outputs = model.generate(**inputs, max_new_tokens=50)
+print(tokenizer.decode(outputs[0]))
 ```
 
-## 📊 Project Structure
+## Running Evaluations
+
+```bash
+# Quick compatibility test (3 prompts)
+python -m smartkv.experiments.run_smartkv_test \
+  --model "NousResearch/Meta-Llama-3.1-8B" \
+  --max-tokens 20 \
+  --output-dir experiments/quick_test
+
+# Comprehensive evaluation (30 prompts across 6 categories)
+python -m smartkv.experiments.comprehensive_evaluation \
+  --model "NousResearch/Meta-Llama-3.1-8B" \
+  --max-tokens 50 \
+  --budget 0.35 \
+  --output-dir experiments/comprehensive_eval
+
+# Analyze results
+python -m smartkv.experiments.analyze_comprehensive_results \
+  experiments/comprehensive_eval/comprehensive_results.json
+```
+
+## Preliminary Results
+
+**Llama 3.1 8B (CPU, 3 prompts, 20 tokens each):**
+- Memory budget: 50% of FP16
+- Latency: 20.3% faster than FP16 baseline (21.8s vs 27.3s)
+- Precision distribution: 25 tokens at 8-bit, 1 token at 2-bit
+- Output quality: Qualitatively similar to baseline
+
+**Note:** Performance improvements on CPU are primarily due to memory bandwidth savings. GPU performance characteristics may differ significantly. Current results compare against FP16 baseline; comparison against uniform INT8/INT4 quantization baselines is ongoing.
+
+## Project Structure
 
 ```
 SmartKV/
 ├── smartkv/
-│   ├── core/              # Core SmartKV components
-│   │   ├── cache.py       # SmartKVCache class
-│   │   ├── quantizers.py  # 2,3,4,8-bit quantizers
-│   │   ├── importance.py  # Attention tracking
-│   │   └── allocation.py  # Precision allocation algorithms
-│   ├── models/            # Model integrations
-│   │   ├── llama_smartkv.py
-│   │   ├── mistral_smartkv.py
-│   │   └── attention.py
-│   ├── baselines/         # Baseline methods
-│   │   ├── uniform_quant.py
-│   │   └── kivi.py
-│   ├── experiments/       # Evaluation scripts
-│   │   ├── run_longbench.py
-│   │   ├── run_ruler.py
-│   │   └── run_needle.py
-│   ├── analysis/          # Analysis tools
-│   │   ├── visualize.py
-│   │   └── error_analysis.py
-│   ├── configs/           # Configuration files
-│   └── utils/             # Utilities
-├── tests/                 # Unit tests
+│   ├── core/
+│   │   ├── quantizers.py      # Quantization implementations
+│   │   ├── importance.py      # Attention importance tracking
+│   │   └── allocation.py      # Precision allocation logic
+│   ├── models/
+│   │   ├── llama_smartkv.py   # Llama integration
+│   │   └── attention.py       # Modified attention layers
+│   └── experiments/
+│       ├── run_smartkv_test.py
+│       ├── comprehensive_evaluation.py
+│       └── analyze_comprehensive_results.py
+├── experiments/               # Experiment outputs
 ├── requirements.txt
-├── plan.md               # Detailed implementation plan
-├── todo.md               # Task tracking
 └── README.md
 ```
 
-## 🔬 How It Works
+## Known Limitations
 
-SmartKV uses a three-phase approach:
+1. **CPU-only implementation**: Current version is not optimized for GPU inference
+2. **Limited baseline comparisons**: Needs evaluation against uniform INT8/INT4 quantization
+3. **No perplexity metrics**: Current evaluation uses output similarity; perplexity-based evaluation needed
+4. **Single architecture**: Only tested with Llama-family models
+5. **No custom CUDA kernels**: Would be required for competitive GPU performance
 
-1. **Track**: Accumulate attention statistics across layers
-2. **Allocate**: Assign precision levels (2,3,4,8 bits) based on importance
-3. **Quantize**: Compress KV-cache with mixed precision
+## Research Context
 
-```python
-# Simplified algorithm
-for each attention computation:
-    # Track attention patterns
-    importance[token] += attention_weights[token].sum()
-    
-    # Periodically reallocate precision
-    if step % realloc_freq == 0:
-        precision_map = allocate_precision(importance, memory_budget)
-    
-    # Quantize with allocated precision
-    for token in new_tokens:
-        bits = precision_map[token]
-        quantizer = quantizers[bits]
-        k_cache[token] = quantizer.quantize(k[token])
-        v_cache[token] = quantizer.quantize(v[token])
-```
+This implementation is designed for research exploration of attention-guided quantization strategies. For production use cases, consider:
+- Established uniform quantization methods (INT8/INT4) with hardware acceleration
+- Methods with optimized GPU kernels (e.g., GPTQ, AWQ for weights; uniform quantization for KV-cache)
+- Trade-off between adaptive allocation complexity and potential accuracy gains
 
-## 📈 Expected Results
-
-| Method | Memory (% FP16) | LongBench Acc | RULER Acc | Needle Acc |
-|--------|----------------|---------------|-----------|------------|
-| FP16 | 100% | 68.5% | 92.3% | 98.1% |
-| INT8 Uniform | 50% | 68.2% | 91.8% | 97.5% |
-| **SmartKV-0.5** | **50%** | **68.0%** | **91.6%** | **97.8%** |
-| INT4 Uniform | 25% | 64.1% | 85.2% | 89.4% |
-| **SmartKV-0.3** | **30%** | **66.5%** | **88.7%** | **94.2%** |
-
-## 🧪 Running Experiments
+## Testing
 
 ```bash
-# LongBench evaluation
-python smartkv/experiments/run_longbench.py --model llama-2-7b --budget 0.5
-
-# Needle-in-Haystack
-python smartkv/experiments/run_needle.py --model llama-2-7b --budget 0.5
-
-# RULER benchmark
-python smartkv/experiments/run_ruler.py --model llama-2-7b --budget 0.5
-```
-
-## 🧪 Testing
-
-```bash
-# Run all tests
+# Run tests (when available)
 pytest tests/
 
-# Run with coverage
-pytest --cov=smartkv tests/
-
-# Run specific test
+# Run specific test module
 pytest tests/test_quantizers.py
 ```
 
-## 📝 Development Status
+## License
 
-- [x] Phase 1: Project Setup & Environment ✅
-- [ ] Phase 2: Core Quantizer Implementation (In Progress)
-- [ ] Phase 3: Importance Tracking System
-- [ ] Phase 4: Precision Allocation Algorithms
-- [ ] Phase 5: SmartKV Cache Implementation
-- [ ] Phase 6: Model Integration - Attention Layer
-- [ ] Phase 7: Model Integration - Llama
-- [ ] Phase 8: Baseline Implementations
+MIT License
 
-See [todo.md](todo.md) for detailed task tracking.
+## Citation
 
-## 🤝 Contributing
-
-This is a research project. Contributions, issues, and feature requests are welcome!
-
-## 📄 License
-
-MIT License (or specify your license)
-
-## 📚 Citation
+If you use this code in your research, please cite:
 
 ```bibtex
-@article{smartkv2024,
+@software{smartkv2024,
   title={SmartKV: Attention-Guided Adaptive Precision for KV-Cache Compression},
   author={[Your Name]},
-  year={2024}
+  year={2024},
+  url={https://github.com/yourusername/SmartKV}
 }
 ```
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- Built with PyTorch and HuggingFace Transformers
-- Inspired by KIVI, GEAR, and other KV-cache compression methods
+Built with PyTorch and Hugging Face Transformers. Inspired by research in KV-cache compression including KIVI, GEAR, and related work on adaptive quantization.
