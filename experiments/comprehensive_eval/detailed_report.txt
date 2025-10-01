@@ -1,0 +1,104 @@
+================================================================================
+SMARTKV COMPREHENSIVE EVALUATION REPORT
+================================================================================
+
+Model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+Memory Budget: 50.0%
+Max New Tokens: 50
+Total Prompts Evaluated: 30
+
+OVERALL STATISTICS
+--------------------------------------------------------------------------------
+FP16 Avg Latency:        9520.75 ms
+SmartKV Avg Latency:     8744.38 ms
+Latency Overhead:        -8.15%
+
+Exact Match Rate:        3.33%
+Avg Word Overlap:        9.06%
+Avg Prefix Match:        1.53 tokens
+
+PER-CATEGORY BREAKDOWN
+--------------------------------------------------------------------------------
+
+FACTUAL KNOWLEDGE
+  Prompts: 5
+  FP16 Latency:     9470.68 ms
+  SmartKV Latency:  8800.85 ms
+  Overhead:         -7.07%
+  Exact Matches:    1/5 (20.0%)
+  Avg Word Overlap: 24.2%
+
+REASONING
+  Prompts: 5
+  FP16 Latency:     9776.61 ms
+  SmartKV Latency:  8985.29 ms
+  Overhead:         -8.09%
+  Exact Matches:    0/5 (0.0%)
+  Avg Word Overlap: 6.0%
+
+CODE
+  Prompts: 5
+  FP16 Latency:     9678.98 ms
+  SmartKV Latency:  8760.96 ms
+  Overhead:         -9.48%
+  Exact Matches:    0/5 (0.0%)
+  Avg Word Overlap: 8.2%
+
+CREATIVE
+  Prompts: 5
+  FP16 Latency:     9409.82 ms
+  SmartKV Latency:  8653.37 ms
+  Overhead:         -8.04%
+  Exact Matches:    0/5 (0.0%)
+  Avg Word Overlap: 6.1%
+
+CONVERSATION
+  Prompts: 5
+  FP16 Latency:     9430.08 ms
+  SmartKV Latency:  8674.20 ms
+  Overhead:         -8.02%
+  Exact Matches:    0/5 (0.0%)
+  Avg Word Overlap: 3.7%
+
+COMPLETION
+  Prompts: 5
+  FP16 Latency:     9358.33 ms
+  SmartKV Latency:  8591.61 ms
+  Overhead:         -8.19%
+  Exact Matches:    0/5 (0.0%)
+  Avg Word Overlap: 6.1%
+
+SAMPLE OUTPUT COMPARISONS
+--------------------------------------------------------------------------------
+
+[1] Category: factual_knowledge
+Prompt: The capital of France is
+Exact Match: ✓
+Word Overlap: 100.0%
+Prefix Match: 43 tokens
+
+[2] Category: factual_knowledge
+Prompt: The first person to walk on the moon was
+Exact Match: ✗
+Word Overlap: 7.4%
+Prefix Match: 0 tokens
+
+[3] Category: factual_knowledge
+Prompt: The largest ocean on Earth is
+Exact Match: ✗
+Word Overlap: 8.8%
+Prefix Match: 0 tokens
+
+[4] Category: factual_knowledge
+Prompt: Python is a programming language created by
+Exact Match: ✗
+Word Overlap: 5.0%
+Prefix Match: 0 tokens
+
+[5] Category: factual_knowledge
+Prompt: The speed of light is approximately
+Exact Match: ✗
+Word Overlap: 0.0%
+Prefix Match: 0 tokens
+
+================================================================================
