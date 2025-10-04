@@ -117,7 +117,7 @@ class ComprehensiveEvaluator:
             # Load base model
             self.base_model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                dtype=torch.float32
+                torch_dtype=torch.float32
             )
             self.base_model = self.base_model.to(self.device)
             self.base_model.eval()
@@ -289,6 +289,9 @@ class ComprehensiveEvaluator:
         categories: List[str] = None
     ) -> Dict[str, Any]:
         """Run comprehensive evaluation."""
+        from smartkv.experiments._thread_utils import configure_threads
+        threads = configure_threads()
+        self.logger.info(f"Configured inference threads: {threads}")
         self.logger.info("="*80)
         self.logger.info("COMPREHENSIVE SMARTKV EVALUATION")
         self.logger.info("="*80)

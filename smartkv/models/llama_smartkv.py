@@ -25,6 +25,7 @@ except ImportError:
 
 from smartkv.core.cache import SmartKVCache
 from smartkv.models.attention import SmartKVAttention
+from smartkv.core.fused_cpu import quantized_attention_streaming_cpu
 
 
 @dataclass
@@ -102,6 +103,7 @@ class LlamaSmartKVAttention(nn.Module):
         self.smartkv_cache: Optional[SmartKVCache] = None
         self.use_smartkv = False
         self.token_counter = 0
+        self.use_fused_cpu = False
     
     def enable_smartkv(self, shared_cache: Optional[SmartKVCache] = None):
         """
@@ -151,6 +153,7 @@ class LlamaSmartKVAttention(nn.Module):
         """
         # DEBUG
         debug = False  # Enable selectively for detailed tracing
+        use_fused_cpu = getattr(self, 'use_fused_cpu', False)
         if debug:
             print(f"\n[DEBUG Layer {self.layer_idx}] Forward called")
             print(f"  use_smartkv: {self.use_smartkv}")
@@ -208,97 +211,114 @@ class LlamaSmartKVAttention(nn.Module):
             position_ids=position_ids,
         )
 
-        # For SmartKV: ALWAYS retrieve past KV from our cache (ignore use_cache parameter)
-        # because transformers sets use_cache=False but we manage our own cache
+        past_quant = None
+        fused_candidate = use_fused_cpu and q_len == 1 and not output_attentions and self.smartkv_cache is not None and hidden_states.device.type == 'cpu'
+        if fused_candidate:
+            past_quant = self.smartkv_cache.retrieve_all_quantized(self.layer_idx)
+
         past_k = None
         past_v = None
-        if debug:
-            print(f"  k_cache size before retrieval: {len(self.smartkv_cache.k_cache)}")
-        if len(self.smartkv_cache.k_cache) > 0:
-            # Retrieve all cached KV for this layer
-            past_k, past_v = self._retrieve_kv_smartkv(bsz)
-            if past_k is not None and debug:
-                print(f"  ✓ Retrieved past KV from SmartKV cache")
-                print(f"  past_k shape: {past_k.shape}")
-            elif past_k is None and debug:
-                print(f"  ✗ Retrieval returned None")
+        seq_offset = 0
 
-        # Handle past KV from SmartKV cache
+        if past_quant is not None:
+            seq_offset = past_quant['k_qx'].shape[0]
+        elif len(self.smartkv_cache.k_cache) > 0:
+            past_k, past_v = self._retrieve_kv_smartkv(bsz)
+            if past_k is not None:
+                seq_offset = past_k.shape[-2]
+
+        key_states_unrepeated = key_states
+        value_states_unrepeated = value_states
+
         if past_k is not None and past_v is not None:
-            if debug:
-                print(f"  Concatenating past KV: past={past_k.shape[-2]}, new={key_states.shape[-2]}")
             key_states = torch.cat([past_k, key_states], dim=2)
             value_states = torch.cat([past_v, value_states], dim=2)
+            key_states_unrepeated = key_states[:, :, seq_offset:, :]
+            value_states_unrepeated = value_states[:, :, seq_offset:, :]
 
-        # Save unrepeated KV states for storage (BEFORE repeat operation)
-        # Only save the NEW tokens, not the concatenated past
-        seq_offset = past_k.shape[-2] if past_k is not None else 0
-        key_states_unrepeated = key_states[:, :, seq_offset:, :]  # Only new tokens
-        value_states_unrepeated = value_states[:, :, seq_offset:, :]
+        fused_active = fused_candidate and past_quant is not None and query_states.device.type == 'cpu'
 
-        # Repeat KV for grouped-query attention
-        if self.num_key_value_groups > 1:
-            key_states = self._repeat_kv(key_states, self.num_key_value_groups)
-            value_states = self._repeat_kv(value_states, self.num_key_value_groups)
-        
-        # Compute attention scores
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (self.head_dim ** 0.5)
-        kv_len = attn_weights.shape[-1]
-        
-        # Apply attention mask
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-            if debug:
-                print(f"  attention_mask shape: {attention_mask.shape}")
-        else:
-            causal_mask = self._build_causal_mask(
-                batch_size=bsz,
-                query_len=q_len,
-                key_len=kv_len,
-                past_len=seq_offset,
-                device=attn_weights.device,
-                dtype=attn_weights.dtype,
+        attn_weights = None
+
+        if fused_active:
+            stored_len = past_quant['k_qx'].shape[0]
+            k_qx = past_quant['k_qx']
+            k_scale = past_quant['k_scale']
+            v_qx = past_quant['v_qx']
+            v_scale = past_quant['v_scale']
+
+            current_k = key_states_unrepeated[:, :, -1, :].squeeze(2)
+            current_v = value_states_unrepeated[:, :, -1, :].squeeze(2)
+
+            if k_qx.shape[1] != self.num_heads:
+                repeat_factor = self.num_heads // k_qx.shape[1]
+                k_qx = k_qx.repeat_interleave(repeat_factor, dim=1)
+                v_qx = v_qx.repeat_interleave(repeat_factor, dim=1)
+                k_scale = k_scale.repeat_interleave(repeat_factor, dim=1)
+                v_scale = v_scale.repeat_interleave(repeat_factor, dim=1)
+                current_k = current_k.repeat_interleave(repeat_factor, dim=1)
+                current_v = current_v.repeat_interleave(repeat_factor, dim=1)
+
+            mask_cache = None
+            mask_current = None
+            if attention_mask is not None:
+                if stored_len > 0:
+                    mask_cache = attention_mask[..., :stored_len]
+                mask_current = attention_mask[..., stored_len:stored_len + 1]
+
+            attn_stream, attn_probs = quantized_attention_streaming_cpu(
+                query_states,
+                k_qx,
+                k_scale,
+                v_qx,
+                v_scale,
+                causal_mask=mask_cache,
+                tile_size=2048,
+                dtype=query_states.dtype,
+                current_k=current_k,
+                current_v=current_v,
+                current_mask=mask_current,
+                return_attn=True,
             )
-            attn_weights = attn_weights + causal_mask
-            if debug:
-                print(f"  applied causal mask shape: {causal_mask.shape}")
+            attn_output = attn_stream.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+            attn_weights = attn_probs
+        else:
+            if self.num_key_value_groups > 1:
+                key_states = self._repeat_kv(key_states, self.num_key_value_groups)
+                value_states = self._repeat_kv(value_states, self.num_key_value_groups)
 
-        # Softmax
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        
-        # Track attention with SmartKV
-        # Generate token IDs if not provided
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / (self.head_dim ** 0.5)
+            kv_len = attn_weights.shape[-1]
+
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            else:
+                causal_mask = self._build_causal_mask(
+                    batch_size=bsz,
+                    query_len=q_len,
+                    key_len=kv_len,
+                    past_len=seq_offset,
+                    device=attn_weights.device,
+                    dtype=attn_weights.dtype,
+                )
+                attn_weights = attn_weights + causal_mask
+
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+            attn_output = torch.matmul(attn_weights, value_states)
+            attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+
         if token_ids is None:
             token_ids = list(range(self.token_counter, self.token_counter + q_len))
             self.token_counter += q_len
 
-        if debug:
-            print(f"  token_ids: {token_ids}")
-            print(f"  attn_weights shape: {attn_weights.shape}")
-
         if len(token_ids) > 0:
-            self.smartkv_cache.update_attention(
-                self.layer_idx,
-                attn_weights,
-                token_ids
-            )
-
-            if debug:
-                print(f"  Attention updated in cache")
-                print(f"  Cache k_cache size: {len(self.smartkv_cache.k_cache)}")
-
-            # Store KV with adaptive precision (use unrepeated states)
+            if attn_weights is not None:
+                self.smartkv_cache.update_attention(
+                    self.layer_idx,
+                    attn_weights,
+                    token_ids
+                )
             self._store_kv_smartkv(key_states_unrepeated, value_states_unrepeated, token_ids, bsz)
-
-            if debug:
-                print(f"  After store - k_cache size: {len(self.smartkv_cache.k_cache)}")
-        
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, value_states)
-        
-        # Reshape back
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         
         # Output projection
         attn_output = self.o_proj(attn_output)
@@ -319,33 +339,26 @@ class LlamaSmartKVAttention(nn.Module):
         batch_size: int
     ):
         """Store KV with SmartKV cache."""
-        debug = False  # Disable debug logging
-        seq_len = key_states.shape[2]
+        debug = False
+        if batch_size == 0 or not token_ids:
+            return
+
+        seq_len = min(key_states.shape[2], len(token_ids))
+        if seq_len == 0:
+            return
+
+        k_batch = key_states[0, :, :seq_len, :].transpose(0, 1).contiguous()
+        v_batch = value_states[0, :, :seq_len, :].transpose(0, 1).contiguous()
 
         if debug:
-            print(f"  [_store_kv_smartkv] seq_len: {seq_len}, num_token_ids: {len(token_ids)}")
-            print(f"  [_store_kv_smartkv] key_states shape: {key_states.shape}")
+            print(f"  [_store_kv_smartkv] storing batch: {seq_len} tokens")
 
-        stored_count = 0
-        for token_idx, token_id in enumerate(token_ids):
-            if token_idx < seq_len and batch_size > 0:
-                k_token = key_states[0, :, token_idx, :]  # [num_heads, head_dim]
-                v_token = value_states[0, :, token_idx, :]
-
-                if debug and token_idx < 2:  # Only print first 2
-                    print(f"    Storing token_idx={token_idx}, token_id={token_id}")
-                    print(f"    k_token shape: {k_token.shape}")
-
-                self.smartkv_cache.quantize_and_store(
-                    self.layer_idx,
-                    token_id,
-                    k_token,
-                    v_token
-                )
-                stored_count += 1
-
-        if debug:
-            print(f"  [_store_kv_smartkv] Stored {stored_count} tokens")
+        self.smartkv_cache.quantize_and_store_batch(
+            self.layer_idx,
+            token_ids[:seq_len],
+            k_batch,
+            v_batch,
+        )
 
     def _retrieve_kv_smartkv(self, batch_size: int):
         """
@@ -354,58 +367,32 @@ class LlamaSmartKVAttention(nn.Module):
         Returns:
             Tuple of (past_k, past_v) tensors or (None, None) if no cache
         """
-        debug = self.layer_idx == 0  # Enable debug for layer 0
+        debug = False
 
         # Get all token IDs stored in cache
         if not self.smartkv_cache.k_cache:
             return None, None
 
-        # Collect all tokens for this layer
-        # Cache keys are tuples: (layer_idx, token_id)
-        layer_token_ids = []
-        for cache_key in self.smartkv_cache.k_cache.keys():
-            layer_idx, token_id = cache_key
-            if layer_idx == self.layer_idx:
-                layer_token_ids.append(token_id)
+        keys, values = self.smartkv_cache.retrieve_all(self.layer_idx)
 
-        if not layer_token_ids:
+        if keys is None or values is None or keys.numel() == 0:
             return None, None
-
-        # Sort token IDs to maintain order
-        layer_token_ids.sort()
 
         if debug:
-            print(f"  [_retrieve_kv_smartkv] Retrieving {len(layer_token_ids)} tokens for layer {self.layer_idx}")
+            print(f"  [_retrieve_kv_smartkv] Batch retrieved {keys.shape[0]} tokens")
+            print(f"    Keys shape: {keys.shape}, Values shape: {values.shape}")
 
-        # Retrieve and dequantize each token
-        k_tensors = []
-        v_tensors = []
-
-        for i, token_id in enumerate(layer_token_ids):
-            k_token, v_token = self.smartkv_cache.retrieve(
-                self.layer_idx,
-                token_id
-            )
-
-            if k_token is not None and v_token is not None:
-                if debug and i < 2:  # Print first 2 tokens
-                    print(f"    Retrieved token_id={token_id}: k_token shape={k_token.shape}, mean={k_token.mean():.4f}, std={k_token.std():.4f}")
-                k_tensors.append(k_token.unsqueeze(1))  # [num_heads, 1, head_dim]
-                v_tensors.append(v_token.unsqueeze(1))
-
-        if not k_tensors:
-            return None, None
-
-        # Concatenate along sequence dimension
-        past_k = torch.cat(k_tensors, dim=1)  # [num_heads, seq_len, head_dim]
-        past_v = torch.cat(v_tensors, dim=1)
+        # Keys/values are [num_tokens, num_heads, head_dim]
+        # Need to transpose to [num_heads, num_tokens, head_dim]
+        past_k = keys.transpose(0, 1)  # [num_heads, seq_len, head_dim]
+        past_v = values.transpose(0, 1)
 
         # Reshape to match expected format: [batch_size, num_heads, seq_len, head_dim]
         past_k = past_k.unsqueeze(0).expand(batch_size, -1, -1, -1)
         past_v = past_v.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
         if debug:
-            print(f"  [_retrieve_kv_smartkv] Retrieved past_k shape: {past_k.shape}")
+            print(f"  [_retrieve_kv_smartkv] Final past_k shape: {past_k.shape}")
 
         return past_k, past_v
 
@@ -525,6 +512,7 @@ class LlamaSmartKV(nn.Module):
         self.model = model
         self.smartkv_config = smartkv_config or SmartKVConfig()
         self.smartkv_cache: Optional[SmartKVCache] = None
+        self.use_fused_cpu = False
         
         # Replace attention layers
         if self.smartkv_config.enabled:
@@ -542,11 +530,13 @@ class LlamaSmartKV(nn.Module):
         if layers and hasattr(layers[0], 'self_attn'):
             first_attn = layers[0].self_attn
 
-            # Get num_heads and head_dim from config or attention module
-            if hasattr(first_attn, 'num_heads'):
+            # Determine KV head count and head_dim
+            if hasattr(first_attn, 'num_key_value_heads'):
+                num_heads = first_attn.num_key_value_heads
+            elif hasattr(first_attn, 'num_heads'):
                 num_heads = first_attn.num_heads
             elif hasattr(self.model, 'config'):
-                num_heads = self.model.config.num_attention_heads
+                num_heads = getattr(self.model.config, 'num_key_value_heads', self.model.config.num_attention_heads)
             else:
                 raise ValueError("Cannot determine num_heads")
 
@@ -557,6 +547,18 @@ class LlamaSmartKV(nn.Module):
             else:
                 raise ValueError("Cannot determine head_dim")
 
+            # Get special token IDs from tokenizer if available
+            special_tokens = []
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'bos_token_id'):
+                if self.model.config.bos_token_id is not None:
+                    special_tokens.append(self.model.config.bos_token_id)
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'eos_token_id'):
+                if self.model.config.eos_token_id is not None:
+                    special_tokens.append(self.model.config.eos_token_id)
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'pad_token_id'):
+                if self.model.config.pad_token_id is not None:
+                    special_tokens.append(self.model.config.pad_token_id)
+
             self.smartkv_cache = SmartKVCache(
                 num_layers=num_layers,
                 num_heads=num_heads,
@@ -565,7 +567,8 @@ class LlamaSmartKV(nn.Module):
                 decay=self.smartkv_config.decay,
                 realloc_freq=self.smartkv_config.realloc_freq,
                 available_bits=self.smartkv_config.available_bits,
-                device=self.smartkv_config.device
+                device=self.smartkv_config.device,
+                special_token_ids=special_tokens
             )
         
         # Replace attention in each layer
@@ -579,6 +582,7 @@ class LlamaSmartKV(nn.Module):
                     layer_idx,
                     self.smartkv_config
                 )
+                smartkv_attn.use_fused_cpu = self.use_fused_cpu
                 if getattr(smartkv_attn, 'rotary_emb', None) is None and shared_rotary_emb is not None:
                     smartkv_attn.rotary_emb = shared_rotary_emb
                 smartkv_attn.enable_smartkv(self.smartkv_cache)
@@ -641,7 +645,15 @@ class LlamaSmartKV(nn.Module):
         for layer in self.model.model.layers:
             if hasattr(layer.self_attn, 'token_counter'):
                 layer.self_attn.token_counter = 0
-    
+
+    def set_use_fused_cpu(self, enabled: bool) -> None:
+        """Toggle fused CPU streaming attention for all SmartKV layers."""
+        self.use_fused_cpu = enabled
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            for layer in self.model.model.layers:
+                if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaSmartKVAttention):
+                    layer.self_attn.use_fused_cpu = enabled
+
     def __getattr__(self, name):
         """Delegate attribute access to wrapped model."""
         try:

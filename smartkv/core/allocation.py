@@ -398,43 +398,132 @@ def _round_to_nearest_bits(value: float, available_bits: List[int]) -> int:
     return min(available_bits, key=lambda b: abs(b - value))
 
 
+def compute_minimum_budget(
+    num_heads: int = 8,
+    head_dim: int = 128,
+    scale_dtype: str = "fp32",
+    use_packing: bool = False
+) -> float:
+    """
+    Compute minimum achievable budget given storage constraints.
+
+    Args:
+        num_heads: Number of attention heads
+        head_dim: Head dimension
+        scale_dtype: Scale factor dtype ("fp32" or "fp16")
+        use_packing: Whether bit-packing is implemented
+
+    Returns:
+        Minimum budget ratio (cannot go below this)
+
+    Examples:
+        INT8 + FP32 scales: 0.5313
+        INT8 + FP16 scales: 0.5156
+        4-bit packed + FP32 scales: 0.2656
+        4-bit packed + FP16 scales: 0.2578
+    """
+    scale_bits = 32 if scale_dtype == "fp32" else 16
+
+    if use_packing:
+        # Minimum with 2-bit packing
+        payload_bits = 2 * num_heads * head_dim * 2  # K and V at 2-bit
+    else:
+        # INT8 storage regardless of target bits
+        payload_bits = 2 * num_heads * head_dim * 8  # K and V at INT8
+
+    # Scale metadata: 2 * num_heads * scale_bits (one per head for K and V)
+    scale_bits_total = 2 * num_heads * scale_bits
+
+    # FP16 baseline: 2 * num_heads * head_dim * 16
+    fp16_bits = 2 * num_heads * head_dim * 16
+
+    min_ratio = (payload_bits + scale_bits_total) / fp16_bits
+    return min_ratio
+
+
 def compute_memory_usage(
     allocation: Dict[int, int],
-    fp16_baseline: bool = True
+    fp16_baseline: bool = True,
+    num_heads: int = 8,
+    head_dim: int = 128,
+    scale_dtype: str = "fp32",
+    use_packing: bool = False
 ) -> Dict[str, float]:
     """
     Compute memory usage statistics for an allocation.
-    
+
+    NOTE: Current implementation stores all quantized values as INT8,
+    regardless of target bit-width (2/3/4/8). This means actual memory
+    usage is 8 bits per element, not the target bit-width, unless
+    bit-packing is implemented.
+
     Args:
         allocation: Dict mapping token_id -> bits
         fp16_baseline: If True, compute relative to FP16
-    
+        num_heads: Number of attention heads (for scale metadata)
+        head_dim: Head dimension (default 128)
+        scale_dtype: Scale factor dtype ("fp32" or "fp16")
+        use_packing: Whether bit-packing is implemented
+
     Returns:
-        Dict with memory statistics
+        Dict with memory statistics including scale overhead
     """
     if not allocation:
         return {
             'total_bits': 0,
+            'total_bits_with_scales': 0,
             'avg_bits': 0.0,
             'memory_ratio': 0.0,
-            'num_tokens': 0
+            'memory_ratio_true': 0.0,
+            'num_tokens': 0,
+            'scale_overhead_pct': 0.0
         }
-    
+
     num_tokens = len(allocation)
-    total_bits = sum(bits * 2 for bits in allocation.values())  # K and V
-    avg_bits = total_bits / (num_tokens * 2)
-    
-    if fp16_baseline:
-        fp16_bits = num_tokens * 16 * 2
-        memory_ratio = total_bits / fp16_bits
+    scale_bits = 32 if scale_dtype == "fp32" else 16
+
+    # Theoretical bits (if we had bit-packing)
+    total_bits_theoretical = sum(bits * 2 * num_heads * head_dim for bits in allocation.values())
+
+    # Actual bits (depends on storage implementation)
+    if use_packing:
+        # With bit-packing: use actual bit-widths
+        payload_bits = sum(bits * 2 * num_heads * head_dim for bits in allocation.values())
     else:
-        memory_ratio = 1.0
-    
+        # Without bit-packing: all stored as INT8
+        payload_bits = num_tokens * 2 * num_heads * head_dim * 8
+
+    # Scale metadata: 2 * num_heads * scale_bits per token
+    scale_bits_total = num_tokens * 2 * num_heads * scale_bits
+
+    total_bits_actual = payload_bits + scale_bits_total
+
+    # Average assigned bits (theoretical, for allocation decisions)
+    avg_bits = sum(allocation.values()) / len(allocation) if allocation else 0.0
+
+    if fp16_baseline:
+        # FP16 baseline: 2 * num_heads * head_dim * 16 bits per token
+        fp16_bits = num_tokens * 2 * num_heads * head_dim * 16
+        memory_ratio_theoretical = total_bits_theoretical / fp16_bits if fp16_bits > 0 else 0.0
+        memory_ratio_actual = total_bits_actual / fp16_bits if fp16_bits > 0 else 0.0
+    else:
+        memory_ratio_theoretical = 1.0
+        memory_ratio_actual = 1.0
+
+    scale_overhead_pct = ((scale_bits_total) / total_bits_actual * 100) if total_bits_actual > 0 else 0.0
+
     return {
-        'total_bits': total_bits,
-        'avg_bits': avg_bits,
-        'memory_ratio': memory_ratio,
-        'num_tokens': num_tokens
+        'total_bits': total_bits_theoretical,  # Theoretical (with packing)
+        'total_bits_actual': total_bits_actual,  # Actual (storage + scales)
+        'payload_bits': payload_bits,  # Just K/V storage
+        'scale_bits': scale_bits_total,  # Just scales
+        'avg_bits': avg_bits,  # Average assigned bits per token
+        'memory_ratio': memory_ratio_theoretical,  # Theoretical budget usage
+        'memory_ratio_true': memory_ratio_actual,  # True memory usage
+        'num_tokens': num_tokens,
+        'scale_overhead_pct': scale_overhead_pct,
+        'storage_mode': 'packed' if use_packing else 'int8',
+        'scale_dtype': scale_dtype
     }
 
 
