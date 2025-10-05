@@ -1,0 +1,24 @@
+# GPU-specific dependencies for SmartKV
+# Install with: pip install -r requirements-gpu.txt
+
+# CUDA Python bindings
+cuda-python>=12.0
+
+# Triton compiler for GPU kernels (alternative to raw CUDA)
+triton>=2.1.0
+
+# Fast C++/CUDA build system
+ninja>=1.11.0
+
+# FlashAttention reference implementation (optional, for comparison)
+flash-attn>=2.3.0
+
+# GPU profiling and monitoring
+py3nvml>=0.2.7
+gpustat>=1.1.0
+
+# Additional PyTorch GPU utilities
+torch>=2.0.0  # Already in main requirements.txt, but ensure CUDA support
+
+# Optional: DeepSpeed for distributed training
+# deepspeed>=0.10.0  # Uncomment if using multi-GPU training

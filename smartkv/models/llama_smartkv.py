@@ -27,6 +27,13 @@ from smartkv.core.cache import SmartKVCache
 from smartkv.models.attention import SmartKVAttention
 from smartkv.core.fused_cpu import quantized_attention_streaming_cpu
 
+# GPU kernel support (optional)
+try:
+    from smartkv.kernels import quantized_attention, CUDA_AVAILABLE
+except ImportError:
+    quantized_attention = None
+    CUDA_AVAILABLE = False
+
 
 @dataclass
 class SmartKVConfig:
@@ -104,6 +111,7 @@ class LlamaSmartKVAttention(nn.Module):
         self.use_smartkv = False
         self.token_counter = 0
         self.use_fused_cpu = False
+        self.use_fused_gpu = True  # Enable GPU fused attention by default when available
     
     def enable_smartkv(self, shared_cache: Optional[SmartKVCache] = None):
         """
@@ -212,7 +220,13 @@ class LlamaSmartKVAttention(nn.Module):
         )
 
         past_quant = None
-        fused_candidate = use_fused_cpu and q_len == 1 and not output_attentions and self.smartkv_cache is not None and hidden_states.device.type == 'cpu'
+        device_type = hidden_states.device.type
+
+        # Determine if we can use fused attention (CPU or GPU)
+        fused_candidate_cpu = use_fused_cpu and q_len == 1 and not output_attentions and self.smartkv_cache is not None and device_type == 'cpu'
+        fused_candidate_gpu = self.use_fused_gpu and CUDA_AVAILABLE and q_len == 1 and not output_attentions and self.smartkv_cache is not None and device_type == 'cuda'
+
+        fused_candidate = fused_candidate_cpu or fused_candidate_gpu
         if fused_candidate:
             past_quant = self.smartkv_cache.retrieve_all_quantized(self.layer_idx)
 
@@ -236,11 +250,12 @@ class LlamaSmartKVAttention(nn.Module):
             key_states_unrepeated = key_states[:, :, seq_offset:, :]
             value_states_unrepeated = value_states[:, :, seq_offset:, :]
 
-        fused_active = fused_candidate and past_quant is not None and query_states.device.type == 'cpu'
+        fused_active_cpu = fused_candidate_cpu and past_quant is not None
+        fused_active_gpu = fused_candidate_gpu and past_quant is not None
 
         attn_weights = None
 
-        if fused_active:
+        if fused_active_cpu:
             stored_len = past_quant['k_qx'].shape[0]
             k_qx = past_quant['k_qx']
             k_scale = past_quant['k_scale']
@@ -282,6 +297,82 @@ class LlamaSmartKVAttention(nn.Module):
             )
             attn_output = attn_stream.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
             attn_weights = attn_probs
+
+        elif fused_active_gpu:
+            # GPU fused attention using CUDA kernel
+            stored_len = past_quant['k_qx'].shape[0]
+            k_qx = past_quant['k_qx']
+            k_scale = past_quant['k_scale']
+            v_qx = past_quant['v_qx']
+            v_scale = past_quant['v_scale']
+
+            # Get current key/value (the new token being generated)
+            current_k = key_states_unrepeated[:, :, -1, :].squeeze(2)  # [bsz, num_kv_heads, head_dim]
+            current_v = value_states_unrepeated[:, :, -1, :].squeeze(2)
+
+            # Handle GQA: repeat KV heads to match query heads if needed
+            if k_qx.shape[1] != self.num_heads:
+                repeat_factor = self.num_heads // k_qx.shape[1]
+                k_qx = k_qx.repeat_interleave(repeat_factor, dim=1)
+                v_qx = v_qx.repeat_interleave(repeat_factor, dim=1)
+                k_scale = k_scale.repeat_interleave(repeat_factor, dim=1)
+                v_scale = v_scale.repeat_interleave(repeat_factor, dim=1)
+                current_k = current_k.repeat_interleave(repeat_factor, dim=1)
+                current_v = current_v.repeat_interleave(repeat_factor, dim=1)
+
+            # Move quantized cache to GPU if needed
+            if k_qx.device.type != 'cuda':
+                k_qx = k_qx.to(hidden_states.device)
+                k_scale = k_scale.to(hidden_states.device)
+                v_qx = v_qx.to(hidden_states.device)
+                v_scale = v_scale.to(hidden_states.device)
+
+            # Append current token to cached KV (need FP32 for current, will be handled by kernel)
+            # For now, use dequantized approach - quantize current token first
+            from smartkv.core._quant_cpu import quantize_per_head
+            current_k_cpu = current_k.cpu()
+            current_v_cpu = current_v.cpu()
+            current_k_qx, current_v_qx, current_k_scale, current_v_scale = quantize_per_head(
+                current_k_cpu.unsqueeze(0), current_v_cpu.unsqueeze(0), bits=8
+            )
+            current_k_qx = current_k_qx.squeeze(0).to(hidden_states.device)
+            current_v_qx = current_v_qx.squeeze(0).to(hidden_states.device)
+            current_k_scale = current_k_scale.squeeze(0).to(hidden_states.device)
+            current_v_scale = current_v_scale.squeeze(0).to(hidden_states.device)
+
+            # Concatenate with cached KV
+            k_qx_full = torch.cat([k_qx, current_k_qx.unsqueeze(0)], dim=0)  # [N+1, H, D]
+            v_qx_full = torch.cat([v_qx, current_v_qx.unsqueeze(0)], dim=0)
+            k_scale_full = torch.cat([k_scale, current_k_scale.unsqueeze(0)], dim=0)  # [N+1, H]
+            v_scale_full = torch.cat([v_scale, current_v_scale.unsqueeze(0)], dim=0)
+
+            # Build attention mask for CUDA kernel
+            mask_gpu = None
+            if attention_mask is not None:
+                # attention_mask is [bsz, 1, q_len, kv_len], we need to extract for current position
+                mask_gpu = attention_mask[:, 0, -1, :]  # [bsz, kv_len]
+
+            # Call CUDA fused attention kernel
+            # query_states: [bsz, num_heads, 1, head_dim]
+            # k_qx_full: [kv_len, num_heads, head_dim]
+            # We need to add batch dimension to match
+            k_qx_batched = k_qx_full.unsqueeze(0).expand(bsz, -1, -1, -1)  # [bsz, kv_len, num_heads, head_dim]
+            v_qx_batched = v_qx_full.unsqueeze(0).expand(bsz, -1, -1, -1)
+            k_scale_batched = k_scale_full.unsqueeze(0).expand(bsz, -1, -1)  # [bsz, kv_len, num_heads]
+            v_scale_batched = v_scale_full.unsqueeze(0).expand(bsz, -1, -1)
+
+            attn_output_gpu = quantized_attention(
+                query_states.squeeze(2),  # [bsz, num_heads, head_dim]
+                k_qx_batched,
+                k_scale_batched,
+                v_qx_batched,
+                v_scale_batched,
+                attention_mask=mask_gpu,
+                use_cuda=True
+            )  # [bsz, num_heads, head_dim]
+
+            attn_output = attn_output_gpu.unsqueeze(2).transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+
         else:
             if self.num_key_value_groups > 1:
                 key_states = self._repeat_kv(key_states, self.num_key_value_groups)
@@ -513,6 +604,7 @@ class LlamaSmartKV(nn.Module):
         self.smartkv_config = smartkv_config or SmartKVConfig()
         self.smartkv_cache: Optional[SmartKVCache] = None
         self.use_fused_cpu = False
+        self.use_fused_gpu = True  # Enable GPU fused attention by default
         
         # Replace attention layers
         if self.smartkv_config.enabled:
@@ -583,6 +675,7 @@ class LlamaSmartKV(nn.Module):
                     self.smartkv_config
                 )
                 smartkv_attn.use_fused_cpu = self.use_fused_cpu
+                smartkv_attn.use_fused_gpu = getattr(self, 'use_fused_gpu', True)
                 if getattr(smartkv_attn, 'rotary_emb', None) is None and shared_rotary_emb is not None:
                     smartkv_attn.rotary_emb = shared_rotary_emb
                 smartkv_attn.enable_smartkv(self.smartkv_cache)
@@ -653,6 +746,14 @@ class LlamaSmartKV(nn.Module):
             for layer in self.model.model.layers:
                 if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaSmartKVAttention):
                     layer.self_attn.use_fused_cpu = enabled
+
+    def set_use_fused_gpu(self, enabled: bool) -> None:
+        """Toggle fused GPU attention for all SmartKV layers (requires CUDA extension)."""
+        self.use_fused_gpu = enabled
+        if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+            for layer in self.model.model.layers:
+                if hasattr(layer, 'self_attn') and isinstance(layer.self_attn, LlamaSmartKVAttention):
+                    layer.self_attn.use_fused_gpu = enabled
 
     def __getattr__(self, name):
         """Delegate attribute access to wrapped model."""

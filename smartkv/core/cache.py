@@ -17,6 +17,14 @@ from smartkv.core.quantizers import get_quantizer, QuantizerBase
 from smartkv.core.importance import ImportanceTracker
 from smartkv.core.allocation import greedy_allocation, compute_memory_usage
 
+# Bit-packing support (GPU only)
+try:
+    from smartkv.kernels.bit_packing import pack_tensor, unpack_tensor, CUDA_AVAILABLE as PACKING_AVAILABLE
+except ImportError:
+    PACKING_AVAILABLE = False
+    pack_tensor = None
+    unpack_tensor = None
+
 
 class SmartKVCache:
     """
@@ -36,7 +44,8 @@ class SmartKVCache:
         realloc_freq: int = 16,
         available_bits: List[int] = [2, 3, 4, 8],
         device: str = "cpu",
-        special_token_ids: Optional[List[int]] = None
+        special_token_ids: Optional[List[int]] = None,
+        use_bit_packing: bool = True
     ):
         """
         Initialize SmartKV cache.
@@ -51,6 +60,7 @@ class SmartKVCache:
             available_bits: Available bit-widths for quantization
             device: Device to store cache on ("cpu" or "cuda")
             special_token_ids: Token IDs to always keep at 8-bit (BOS, EOS, etc.)
+            use_bit_packing: Enable bit-packing for sub-byte storage (GPU only, requires CUDA)
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -61,7 +71,15 @@ class SmartKVCache:
         self.device = device
 
         # Storage configuration
-        self.use_packing = False  # Bit-packing not yet implemented
+        # Enable bit-packing only if requested, available, and on CUDA
+        self.use_packing = use_bit_packing and PACKING_AVAILABLE and (device != "cpu")
+        if use_bit_packing and not self.use_packing:
+            import warnings
+            if not PACKING_AVAILABLE:
+                warnings.warn("Bit-packing requested but CUDA extension not available. Falling back to INT8 storage.")
+            elif device == "cpu":
+                warnings.warn("Bit-packing is only supported on CUDA devices. Falling back to INT8 storage.")
+
         self.scale_dtype = "fp32"  # FP32 scales (can be changed to "fp16")
 
         # Validate and adjust memory budget
@@ -103,7 +121,8 @@ class SmartKVCache:
         # Importance tracking
         self.importance_tracker = ImportanceTracker(
             num_layers=num_layers,
-            decay=decay
+            decay=decay,
+            device=device
         )
         
         # Precision mapping: token_id -> bits
@@ -305,7 +324,7 @@ class SmartKVCache:
 
     def _init_layer_store(self) -> Dict[str, Any]:
         """Create empty storage buffers for a layer."""
-        return {
+        store = {
             'capacity': 0,
             'size': 0,
             'token_ids': None,
@@ -315,6 +334,15 @@ class SmartKVCache:
             'v_scale': None,
             'bits': None,
         }
+
+        # Bit-packing fields (optional)
+        if self.use_packing:
+            store['k_packed'] = {}  # Dict[int, torch.Tensor] - slot -> packed tensor
+            store['v_packed'] = {}  # Dict[int, torch.Tensor] - slot -> packed tensor
+            store['k_shapes'] = {}  # Dict[int, tuple] - slot -> original shape
+            store['v_shapes'] = {}  # Dict[int, tuple] - slot -> original shape
+
+        return store
 
     def _ensure_layer_capacity(self, layer_store: Dict[str, Any], min_capacity: int) -> None:
         """Ensure buffers can hold at least `min_capacity` tokens."""
@@ -326,9 +354,12 @@ class SmartKVCache:
             new_capacity *= 2
 
         def _grow_tensor(tensor: Optional[torch.Tensor], shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            # Determine device from existing tensor or use self.device
+            device = tensor.device if tensor is not None else self.device
+
             if tensor is None:
-                return torch.empty(shape, dtype=dtype)
-            new_tensor = torch.empty(shape, dtype=dtype)
+                return torch.empty(shape, dtype=dtype, device=device)
+            new_tensor = torch.empty(shape, dtype=dtype, device=device)
             prev = tensor.shape[0]
             if prev > 0:
                 new_tensor[:prev] = tensor
@@ -387,23 +418,28 @@ class SmartKVCache:
 
         layer_store = self.layer_store[layer_idx]
 
-        k_cpu = k_batch.detach().to(torch.float32)
-        v_cpu = v_batch.detach().to(torch.float32)
-        if k_cpu.device.type != "cpu":
-            k_cpu = k_cpu.cpu()
-        if v_cpu.device.type != "cpu":
-            v_cpu = v_cpu.cpu()
+        # Keep tensors on target device (CPU or CUDA)
+        k_device = k_batch.detach().to(torch.float32)
+        v_device = v_batch.detach().to(torch.float32)
 
-        seq_len = k_cpu.shape[0]
+        # Move to CPU only if device is CPU, otherwise keep on GPU
+        if self.device == "cpu":
+            if k_device.device.type != "cpu":
+                k_device = k_device.cpu()
+            if v_device.device.type != "cpu":
+                v_device = v_device.cpu()
+
+        seq_len = k_device.shape[0]
         assert seq_len == len(token_ids), "Mismatched KV batch length"
 
         bits_list = [self.precision_map.get(token_id, 4) for token_id in token_ids]
-        bits_tensor = torch.tensor(bits_list, dtype=torch.uint8)
+        bits_tensor = torch.tensor(bits_list, dtype=torch.uint8, device=k_device.device)
 
-        k_qx = torch.empty((seq_len, self.num_heads, self.head_dim), dtype=torch.int8)
-        v_qx = torch.empty((seq_len, self.num_heads, self.head_dim), dtype=torch.int8)
-        k_scale = torch.empty((seq_len, self.num_heads), dtype=torch.float32)
-        v_scale = torch.empty((seq_len, self.num_heads), dtype=torch.float32)
+        # Allocate quantized buffers on same device as input
+        k_qx = torch.empty((seq_len, self.num_heads, self.head_dim), dtype=torch.int8, device=k_device.device)
+        v_qx = torch.empty((seq_len, self.num_heads, self.head_dim), dtype=torch.int8, device=k_device.device)
+        k_scale = torch.empty((seq_len, self.num_heads), dtype=torch.float32, device=k_device.device)
+        v_scale = torch.empty((seq_len, self.num_heads), dtype=torch.float32, device=k_device.device)
 
         unique_bits = bits_tensor.unique(sorted=True)
         for bits in unique_bits.tolist():
@@ -411,8 +447,8 @@ class SmartKVCache:
             if not bool(mask.any()):
                 continue
 
-            k_subset = k_cpu[mask]
-            v_subset = v_cpu[mask]
+            k_subset = k_device[mask]
+            v_subset = v_device[mask]
 
             max_val = 2 ** (bits - 1) - 1
             min_val = -2 ** (bits - 1)
@@ -420,8 +456,24 @@ class SmartKVCache:
                 max_val = 0
                 min_val = 0
 
-            # Keys
-            k_q, v_q, k_scale_subset, v_scale_subset = quantize_per_head(k_subset, v_subset, bits)
+            # Quantize on device (CPU or CUDA)
+            if k_subset.device.type == 'cuda':
+                # Use CUDA quantization if available
+                try:
+                    from smartkv.core._quant_cuda import quantize_per_head_cuda
+                    k_q, v_q, k_scale_subset, v_scale_subset = quantize_per_head_cuda(k_subset, v_subset, bits)
+                except ImportError:
+                    # Fallback to CPU quantization
+                    k_subset_cpu = k_subset.cpu()
+                    v_subset_cpu = v_subset.cpu()
+                    k_q, v_q, k_scale_subset, v_scale_subset = quantize_per_head(k_subset_cpu, v_subset_cpu, bits)
+                    k_q = k_q.to(k_subset.device)
+                    v_q = v_q.to(k_subset.device)
+                    k_scale_subset = k_scale_subset.to(k_subset.device)
+                    v_scale_subset = v_scale_subset.to(k_subset.device)
+            else:
+                # CPU quantization
+                k_q, v_q, k_scale_subset, v_scale_subset = quantize_per_head(k_subset, v_subset, bits)
 
             k_qx[mask] = k_q
             v_qx[mask] = v_q
@@ -443,11 +495,47 @@ class SmartKVCache:
         # If token_ids are not sorted, torch.searchsorted in retrieve/retrieve_all
         # will fail. For non-sequential access patterns, use a dict-based index.
         layer_store['token_ids'][start:new_size] = token_id_tensor
-        layer_store['k_qx'][start:new_size] = k_qx
-        layer_store['v_qx'][start:new_size] = v_qx
-        layer_store['k_scale'][start:new_size] = k_scale
-        layer_store['v_scale'][start:new_size] = v_scale
-        layer_store['bits'][start:new_size] = bits_tensor
+
+        # Store quantized values (with optional bit-packing)
+        if self.use_packing:
+            # Store packed data for each token individually
+            for idx in range(seq_len):
+                slot = start + idx
+                bits = int(bits_tensor[idx])
+
+                # Pack if bits < 8, otherwise store as INT8
+                if bits < 8:
+                    k_vec = k_qx[idx].unsqueeze(0)  # [1, H, D]
+                    v_vec = v_qx[idx].unsqueeze(0)  # [1, H, D]
+
+                    # Pack to compressed format
+                    k_packed = pack_tensor(k_vec.flatten(), bits)
+                    v_packed = pack_tensor(v_vec.flatten(), bits)
+
+                    layer_store['k_packed'][slot] = k_packed
+                    layer_store['v_packed'][slot] = v_packed
+                    layer_store['k_shapes'][slot] = tuple(k_vec.shape)
+                    layer_store['v_shapes'][slot] = tuple(v_vec.shape)
+
+                    # Store dummy INT8 values (won't be used)
+                    layer_store['k_qx'][slot] = torch.zeros_like(k_qx[idx])
+                    layer_store['v_qx'][slot] = torch.zeros_like(v_qx[idx])
+                else:
+                    # 8-bit: store directly as INT8 (no packing needed)
+                    layer_store['k_qx'][slot] = k_qx[idx]
+                    layer_store['v_qx'][slot] = v_qx[idx]
+
+                # Scales are always stored as FP32
+                layer_store['k_scale'][slot] = k_scale[idx]
+                layer_store['v_scale'][slot] = v_scale[idx]
+                layer_store['bits'][slot] = bits_tensor[idx]
+        else:
+            # No packing: store INT8 directly
+            layer_store['k_qx'][start:new_size] = k_qx
+            layer_store['v_qx'][start:new_size] = v_qx
+            layer_store['k_scale'][start:new_size] = k_scale
+            layer_store['v_scale'][start:new_size] = v_scale
+            layer_store['bits'][start:new_size] = bits_tensor
 
         for offset, token_id in enumerate(token_ids):
             slot = start + offset
@@ -511,10 +599,7 @@ class SmartKVCache:
         k = keys[0]
         v = values[0]
 
-        if self.device != "cpu":
-            k = k.to(self.device)
-            v = v.to(self.device)
-
+        # Tensors are already on the correct device from layer_store
         return k, v
     
     def retrieve_all(
@@ -559,10 +644,7 @@ class SmartKVCache:
 
         keys, values = self._dequantize_indices(layer_store, indices)
 
-        if self.device != "cpu":
-            keys = keys.to(self.device)
-            values = values.to(self.device)
-
+        # Tensors are already on the correct device from layer_store
         return keys, values
 
     def retrieve_all_quantized(
@@ -615,15 +697,50 @@ class SmartKVCache:
         layer_store: Dict[str, Any],
         indices: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Vectorized dequantization helper."""
-        k_qx = layer_store['k_qx'][indices].to(torch.float32)
-        v_qx = layer_store['v_qx'][indices].to(torch.float32)
+        """Vectorized dequantization helper with optional bit-unpacking."""
+        if self.use_packing:
+            # Unpack and dequantize each token individually
+            keys_list = []
+            values_list = []
 
-        k_scale = layer_store['k_scale'][indices].unsqueeze(-1)
-        v_scale = layer_store['v_scale'][indices].unsqueeze(-1)
+            for idx in indices.tolist():
+                slot = int(idx)
+                bits = int(layer_store['bits'][slot])
 
-        keys = k_qx * k_scale
-        values = v_qx * v_scale
+                # Check if this token is bit-packed
+                if bits < 8 and slot in layer_store['k_packed']:
+                    # Unpack from compressed format
+                    k_packed = layer_store['k_packed'][slot]
+                    v_packed = layer_store['v_packed'][slot]
+                    k_shape = layer_store['k_shapes'][slot]
+                    v_shape = layer_store['v_shapes'][slot]
+
+                    k_qx = unpack_tensor(k_packed, bits, k_shape).to(torch.float32).squeeze(0)
+                    v_qx = unpack_tensor(v_packed, bits, v_shape).to(torch.float32).squeeze(0)
+                else:
+                    # Use INT8 storage (8-bit or fallback)
+                    k_qx = layer_store['k_qx'][slot].to(torch.float32)
+                    v_qx = layer_store['v_qx'][slot].to(torch.float32)
+
+                # Dequantize with scales
+                k_scale = layer_store['k_scale'][slot].unsqueeze(-1)
+                v_scale = layer_store['v_scale'][slot].unsqueeze(-1)
+
+                keys_list.append(k_qx * k_scale)
+                values_list.append(v_qx * v_scale)
+
+            keys = torch.stack(keys_list, dim=0)
+            values = torch.stack(values_list, dim=0)
+        else:
+            # Standard dequantization (no bit-packing)
+            k_qx = layer_store['k_qx'][indices].to(torch.float32)
+            v_qx = layer_store['v_qx'][indices].to(torch.float32)
+
+            k_scale = layer_store['k_scale'][indices].unsqueeze(-1)
+            v_scale = layer_store['v_scale'][indices].unsqueeze(-1)
+
+            keys = k_qx * k_scale
+            values = v_qx * v_scale
 
         return keys, values
     

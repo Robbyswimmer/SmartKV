@@ -19,22 +19,24 @@ class ImportanceTracker:
     Exponential Moving Average (EMA) for temporal smoothing.
     """
     
-    def __init__(self, num_layers: int, decay: float = 0.9):
+    def __init__(self, num_layers: int, decay: float = 0.9, device: str = "cpu"):
         """
         Initialize importance tracker.
-        
+
         Args:
             num_layers: Number of transformer layers
             decay: EMA decay factor (0 < decay < 1)
                   Higher values give more weight to history
+            device: Device for computation ("cpu" or "cuda")
         """
         self.num_layers = num_layers
         self.decay = decay
-        
+        self.device = device
+
         # Token importance scores
         self.token_importance: Dict[int, float] = {}  # token_id -> cumulative score
         self.layer_importance: Dict[Tuple[int, int], float] = {}  # (layer, token_id) -> score
-        
+
         # History tracking for analysis
         self.importance_history: List[Dict[int, float]] = []
         self.update_count = 0
@@ -67,9 +69,11 @@ class ImportanceTracker:
             key_importance = attention_weights.sum(dim=(0, 1))
         else:
             raise ValueError(f"Expected attention_weights to have 3 or 4 dims, got {attention_weights.dim()}")
-        
-        # Convert to float and update scores
-        key_importance = key_importance.detach().cpu()
+
+        # Convert to float - only move to CPU if we're in CPU mode
+        key_importance = key_importance.detach()
+        if self.device == "cpu" and key_importance.device.type != "cpu":
+            key_importance = key_importance.cpu()
         
         for token_idx, token_id in enumerate(token_ids):
             if token_idx >= len(key_importance):
