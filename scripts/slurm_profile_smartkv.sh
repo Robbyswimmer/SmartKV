@@ -86,3 +86,21 @@ for bs in ${BATCH_SIZES}; do
 done
 
 echo "SmartKV profiling sweep complete at $(date)"
+
+# Optional long-context profiling with Romeo and Juliet
+if [[ "${ENABLE_LONG_CONTEXT:-0}" != "0" ]]; then
+  echo "\n=== Profiling long-context document (${PROFILE_DEVICE}) at $(date) ==="
+  python -u scripts/profile_long_context.py \
+    --document "${LONG_CONTEXT_DOC:-data/romeo_juliet.txt}" \
+    --device "${PROFILE_DEVICE}" \
+    --memory-budget "${CACHE_BUDGET}" \
+    --num-heads "${HEADS}" \
+    --head-dim "${HEAD_DIM}" \
+    --chunk-tokens "${LONG_CONTEXT_CHUNK:-256}" \
+    --seed "${SEED}" \
+    $( [[ "${ENABLE_FORECAST}" != "0" ]] && echo --enable-forecast ) \
+    --forecast-history "${FORECAST_HISTORY}" \
+    --forecast-update-interval "${FORECAST_UPDATE_INTERVAL}" \
+    --forecast-blend "${FORECAST_BLEND}" \
+    --forecast-lr "${FORECAST_LR}"
+fi

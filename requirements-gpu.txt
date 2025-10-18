@@ -10,9 +10,6 @@ triton>=2.1.0
 # Fast C++/CUDA build system
 ninja>=1.11.0
 
-# FlashAttention reference implementation (optional, for comparison)
-flash-attn>=2.3.0
-
 # GPU profiling and monitoring
 py3nvml>=0.2.7
 gpustat>=1.1.0
