@@ -35,9 +35,17 @@ mkdir -p logs
 echo "Installing GCC 11 for CUDA compilation..."
 conda install -y -c conda-forge gxx_linux-64=11 -q
 
+# Reactivate environment to load compiler paths
+set +u  # Temporarily disable unbound variable check for conda
+conda deactivate
+conda activate "${CONDA_ENV}"
+set -u  # Re-enable unbound variable check
+
 # Set compiler environment variables
 export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
 export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
+export CUDAHOSTCXX=${CXX}
+export NVCC_PREPEND_FLAGS="-ccbin ${CXX}"
 echo "Using GCC: $(${CXX} --version | head -1)"
 
 # Build CUDA extensions for the assigned GPU
