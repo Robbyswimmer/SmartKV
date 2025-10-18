@@ -22,11 +22,22 @@ if os.path.exists('requirements-gpu.txt'):
 ext_modules = []
 cmdclass = {}
 
+# Check for CUDA compiler (not runtime) - works during build
+cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+cuda_available = os.path.exists(cuda_home)
+
+print(f"[setup.py] CUDA_HOME: {cuda_home}")
+print(f"[setup.py] CUDA available: {cuda_available}")
+
 try:
     import torch
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
-    if torch.cuda.is_available():
+    print(f"[setup.py] PyTorch version: {torch.__version__}")
+
+    # Build CUDA extensions if compiler is available
+    if cuda_available:
+        print("[setup.py] Building CUDA extensions...")
         ext_modules = [
             CUDAExtension(
                 name='smartkv_cuda',
@@ -55,8 +66,12 @@ try:
             )
         ]
         cmdclass = {'build_ext': BuildExtension}
-except ImportError:
+        print(f"[setup.py] CUDA extensions configured: {len(ext_modules)} module(s)")
+    else:
+        print("[setup.py] Skipping CUDA extensions - CUDA compiler not found")
+except ImportError as e:
     # torch not available during build - skip CUDA extensions
+    print(f"[setup.py] Skipping CUDA extensions - torch not available: {e}")
     pass
 
 setup(
