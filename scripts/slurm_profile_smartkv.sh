@@ -26,6 +26,13 @@ conda activate "${CONDA_ENV}"
 
 mkdir -p logs
 
+# Build CUDA extensions for the assigned GPU
+echo "Building CUDA extensions for this GPU..."
+cd "$(dirname "$(dirname "$0")")" || exit 1
+pip install -e . --no-build-isolation --quiet 2>&1 | grep -v "Requirement already satisfied" || true
+python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'CUDA kernels available: {CUDA_AVAILABLE}')"
+echo "CUDA build complete."
+
 PROFILE_DEVICE=${PROFILE_DEVICE:-cuda}
 BATCH_SIZES=${BATCH_SIZES:-"1 2 4"}
 K_LEN=${K_LEN:-2048}
