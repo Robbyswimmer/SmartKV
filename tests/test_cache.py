@@ -296,10 +296,47 @@ class TestPrecisionAllocation:
         )
         
         token_ids = list(range(10))
-        cache.allocate_precision(token_ids)
+        cache.allocate_precision(0, token_ids)
         
         # All tokens should have precision allocated
         assert len(cache.precision_map) == 10
+
+
+class TestForecasting:
+    """Tests for forecast-guided precision allocation."""
+
+    def test_forecast_predictor_updates(self):
+        """Ensure forecast predictor receives training samples and updates."""
+        cache = SmartKVCache(
+            num_layers=1,
+            num_heads=2,
+            head_dim=16,
+            memory_budget=0.5,
+            enable_forecast=True,
+            forecast_history=32,
+            forecast_update_interval=1,
+            forecast_blend=0.5,
+        )
+
+        token_ids = list(range(4, 8))
+        torch.manual_seed(0)
+
+        # Initial attention update to seed importance
+        attn_weights = torch.rand(1, 2, 4, len(token_ids))
+        cache.update_attention(0, attn_weights, token_ids)
+
+        # Allocate precision to log features
+        cache.allocate_precision(0, token_ids)
+
+        # Second update provides targets for predictor
+        attn_weights_2 = torch.rand(1, 2, 4, len(token_ids))
+        cache.update_attention(0, attn_weights_2, token_ids)
+
+        assert cache.enable_forecast is True
+        assert cache.forecast_predictor is not None
+        assert cache.forecast_last_loss is not None
+        # Forecast should enqueue fresh pending features for the next step
+        assert len(cache.forecast_pending) == len(token_ids)
 
 
 class TestMemoryStats:

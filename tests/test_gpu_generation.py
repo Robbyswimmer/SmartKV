@@ -11,6 +11,13 @@ Tests full model inference with SmartKV on GPU:
 import torch
 import pytest
 
+from smartkv.kernels import quantized_attention, CUDA_AVAILABLE
+
+try:
+    from smartkv.core._quant_cuda import quantize_per_head_cuda
+except ImportError:  # pragma: no cover - optional CUDA extension
+    quantize_per_head_cuda = None
+
 # Skip all tests if CUDA not available
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
@@ -149,12 +156,8 @@ class TestGPUGeneration:
     @pytest.mark.slow
     def test_fused_gpu_attention_integration(self):
         """Test fused GPU attention in full forward pass."""
-        try:
-            from smartkv.kernels import quantized_attention, CUDA_AVAILABLE
-            if not CUDA_AVAILABLE:
-                pytest.skip("CUDA kernels not available")
-        except ImportError:
-            pytest.skip("SmartKV kernels not available")
+        if not CUDA_AVAILABLE:
+            pytest.skip("CUDA kernels not available")
 
         from smartkv.core.cache import SmartKVCache
 
@@ -257,6 +260,73 @@ class TestGPUGeneration:
         print(f"  Actual memory: {stats['memory_ratio']:.1%}")
         print(f"  Avg bits: {stats['avg_bits']:.2f}")
         print(f"  Num tokens: {stats['num_tokens']}")
+
+    def test_quantized_attention_batch_consistency(self):
+        """Fused attention output matches fallback for batch sizes > 1."""
+        if not CUDA_AVAILABLE:
+            pytest.skip("CUDA kernels not available")
+
+        batch_size = 2
+        num_heads = 4
+        head_dim = 32
+        k_len = 64
+        q_len = 1
+
+        torch.manual_seed(77)
+        query = torch.randn(batch_size, num_heads, q_len, head_dim, device='cuda')
+        key_int8 = torch.randint(-128, 127, (batch_size, num_heads, k_len, head_dim), dtype=torch.int8, device='cuda')
+        value_int8 = torch.randint(-128, 127, (batch_size, num_heads, k_len, head_dim), dtype=torch.int8, device='cuda')
+        key_scale = torch.rand(batch_size, num_heads, k_len, device='cuda')
+        value_scale = torch.rand(batch_size, num_heads, k_len, device='cuda')
+        mask = torch.zeros(batch_size, 1, q_len, k_len, device='cuda')
+
+        fused = quantized_attention(
+            query,
+            key_int8,
+            key_scale,
+            value_int8,
+            value_scale,
+            attention_mask=mask,
+            use_cuda=True
+        )
+        reference = quantized_attention(
+            query,
+            key_int8,
+            key_scale,
+            value_int8,
+            value_scale,
+            attention_mask=mask,
+            use_cuda=False
+        )
+
+        torch.cuda.synchronize()
+        assert torch.allclose(fused, reference.to(fused.device), atol=1e-3, rtol=1e-3)
+
+    def test_quantize_per_head_cuda_multi_batch(self):
+        """quantize_per_head_cuda supports batch inputs."""
+        if quantize_per_head_cuda is None:
+            pytest.skip("CUDA quantizer extension not available")
+
+        batch_size = 3
+        num_heads = 3
+        head_dim = 24
+
+        torch.manual_seed(1234)
+        k = torch.randn(batch_size, num_heads, head_dim, device='cuda')
+        v = torch.randn(batch_size, num_heads, head_dim, device='cuda')
+
+        k_q, v_q, k_scale, v_scale = quantize_per_head_cuda(k, v, bits=4)
+
+        assert k_q.shape == (batch_size, num_heads, head_dim)
+        assert v_q.shape == (batch_size, num_heads, head_dim)
+        assert k_scale.shape == (batch_size, num_heads)
+        assert v_scale.shape == (batch_size, num_heads)
+
+        k_recon = k_q.float() * k_scale.unsqueeze(-1)
+        v_recon = v_q.float() * v_scale.unsqueeze(-1)
+
+        assert torch.all(torch.isfinite(k_recon))
+        assert torch.all(torch.isfinite(v_recon))
 
 
 class TestModelIntegration:

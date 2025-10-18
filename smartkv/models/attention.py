@@ -90,6 +90,22 @@ class SmartKVAttention(nn.Module):
             device: Device to store cache on
         """
         self.use_smartkv = True
+        cfg_obj = self.smartkv_config or {}
+
+        def cfg_get(key, default=None):
+            if isinstance(cfg_obj, dict):
+                return cfg_obj.get(key, default)
+            return getattr(cfg_obj, key, default)
+
+        forecast_kwargs = {}
+        if cfg_get('enable_forecast', False):
+            forecast_kwargs = {
+                'enable_forecast': True,
+                'forecast_history': cfg_get('forecast_history', 2048),
+                'forecast_update_interval': cfg_get('forecast_update_interval', 32),
+                'forecast_blend': cfg_get('forecast_blend', 0.5),
+                'forecast_lr': cfg_get('forecast_lr', 0.05),
+            }
         self.smartkv_cache = SmartKVCache(
             num_layers=num_layers,
             num_heads=self.num_heads,
@@ -98,7 +114,8 @@ class SmartKVAttention(nn.Module):
             decay=decay,
             realloc_freq=realloc_freq,
             available_bits=available_bits,
-            device=device
+            device=device,
+            **forecast_kwargs,
         )
     
     def disable_smartkv(self):

@@ -8,6 +8,11 @@ Currently a placeholder that will be implemented with actual CUDA kernels in Pha
 import torch
 from typing import Tuple
 
+try:
+    import smartkv_cuda
+except ImportError:  # pragma: no cover - CUDA extension optional
+    smartkv_cuda = None
+
 
 def quantize_per_head_cuda(
     k_subset: torch.Tensor,
@@ -33,44 +38,31 @@ def quantize_per_head_cuda(
         This is currently a placeholder implementation using PyTorch ops.
         Will be replaced with custom CUDA kernel in Phase 2 for better performance.
     """
-    if not k_subset.is_cuda:
+    if not k_subset.is_cuda or not v_subset.is_cuda:
         raise ValueError("Input tensors must be on CUDA device")
 
-    # Compute quantization range
+    if smartkv_cuda is not None:
+        k_q, k_scale = smartkv_cuda.quantize_per_head_forward(k_subset.contiguous(), bits)
+        v_q, v_scale = smartkv_cuda.quantize_per_head_forward(v_subset.contiguous(), bits)
+        return k_q, v_q, k_scale, v_scale
+
+    # Fallback: use PyTorch ops (slower but functional)
     max_val = 2 ** (bits - 1) - 1
     min_val = -2 ** (bits - 1)
     if bits == 1:
         max_val = 0
         min_val = 0
 
-    # Per-head scale computation (currently using PyTorch ops, will be CUDA kernel)
-    k_abs_max = k_subset.abs().amax(dim=2, keepdim=True)  # [N, H, 1]
+    k_abs_max = k_subset.abs().amax(dim=2, keepdim=True)
     k_scale_subset = k_abs_max / max(max_val, 1)
-    k_scale_subset = torch.where(
-        k_scale_subset == 0,
-        torch.ones_like(k_scale_subset),
-        k_scale_subset
-    )
-    k_q = torch.clamp(
-        torch.round(k_subset / k_scale_subset),
-        min_val,
-        max_val
-    ).to(torch.int8)
+    k_scale_subset = torch.where(k_scale_subset == 0, torch.ones_like(k_scale_subset), k_scale_subset)
+    k_q = torch.clamp(torch.round(k_subset / k_scale_subset), min_val, max_val).to(torch.int8)
 
-    v_abs_max = v_subset.abs().amax(dim=2, keepdim=True)  # [N, H, 1]
+    v_abs_max = v_subset.abs().amax(dim=2, keepdim=True)
     v_scale_subset = v_abs_max / max(max_val, 1)
-    v_scale_subset = torch.where(
-        v_scale_subset == 0,
-        torch.ones_like(v_scale_subset),
-        v_scale_subset
-    )
-    v_q = torch.clamp(
-        torch.round(v_subset / v_scale_subset),
-        min_val,
-        max_val
-    ).to(torch.int8)
+    v_scale_subset = torch.where(v_scale_subset == 0, torch.ones_like(v_scale_subset), v_scale_subset)
+    v_q = torch.clamp(torch.round(v_subset / v_scale_subset), min_val, max_val).to(torch.int8)
 
-    # Reshape scales
     k_scale_out = k_scale_subset.view(-1, k_subset.shape[1])
     v_scale_out = v_scale_subset.view(-1, v_subset.shape[1])
 

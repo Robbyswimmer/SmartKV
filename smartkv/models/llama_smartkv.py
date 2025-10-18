@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
+import warnings
 
 try:
     from transformers import LlamaForCausalLM, LlamaConfig
@@ -45,7 +46,12 @@ class SmartKVConfig:
     realloc_freq: int = 16
     available_bits: List[int] = None
     device: str = "cpu"
-    
+    enable_forecast: bool = False
+    forecast_history: int = 2048
+    forecast_update_interval: int = 32
+    forecast_blend: float = 0.5
+    forecast_lr: float = 0.05
+
     def __post_init__(self):
         if self.available_bits is None:
             self.available_bits = [2, 3, 4, 8]
@@ -322,56 +328,66 @@ class LlamaSmartKVAttention(nn.Module):
 
             # Move quantized cache to GPU if needed
             if k_qx.device.type != 'cuda':
-                k_qx = k_qx.to(hidden_states.device)
-                k_scale = k_scale.to(hidden_states.device)
-                v_qx = v_qx.to(hidden_states.device)
-                v_scale = v_scale.to(hidden_states.device)
+                device = hidden_states.device
+                k_qx = k_qx.to(device)
+                k_scale = k_scale.to(device)
+                v_qx = v_qx.to(device)
+                v_scale = v_scale.to(device)
+            else:
+                device = k_qx.device
 
-            # Append current token to cached KV (need FP32 for current, will be handled by kernel)
-            # For now, use dequantized approach - quantize current token first
-            from smartkv.core._quant_cpu import quantize_per_head
-            current_k_cpu = current_k.cpu()
-            current_v_cpu = current_v.cpu()
-            current_k_qx, current_v_qx, current_k_scale, current_v_scale = quantize_per_head(
-                current_k_cpu.unsqueeze(0), current_v_cpu.unsqueeze(0), bits=8
-            )
-            current_k_qx = current_k_qx.squeeze(0).to(hidden_states.device)
-            current_v_qx = current_v_qx.squeeze(0).to(hidden_states.device)
-            current_k_scale = current_k_scale.squeeze(0).to(hidden_states.device)
-            current_v_scale = current_v_scale.squeeze(0).to(hidden_states.device)
+            # Quantize the current token(s) on device
+            from smartkv.core._quant_cpu import quantize_per_head as quantize_per_head_cpu
+            try:
+                from smartkv.core._quant_cuda import quantize_per_head_cuda
+            except ImportError:
+                quantize_per_head_cuda = None
 
-            # Concatenate with cached KV
-            k_qx_full = torch.cat([k_qx, current_k_qx.unsqueeze(0)], dim=0)  # [N+1, H, D]
-            v_qx_full = torch.cat([v_qx, current_v_qx.unsqueeze(0)], dim=0)
-            k_scale_full = torch.cat([k_scale, current_k_scale.unsqueeze(0)], dim=0)  # [N+1, H]
-            v_scale_full = torch.cat([v_scale, current_v_scale.unsqueeze(0)], dim=0)
+            if quantize_per_head_cuda is not None:
+                current_k_qx, current_v_qx, current_k_scale, current_v_scale = quantize_per_head_cuda(
+                    current_k, current_v, bits=8
+                )
+            else:
+                current_k_qx, current_v_qx, current_k_scale, current_v_scale = quantize_per_head_cpu(
+                    current_k.cpu(), current_v.cpu(), bits=8
+                )
+                current_k_qx = current_k_qx.to(device)
+                current_v_qx = current_v_qx.to(device)
+                current_k_scale = current_k_scale.to(device)
+                current_v_scale = current_v_scale.to(device)
 
-            # Build attention mask for CUDA kernel
+            # Concatenate with cached KV (stored_len tokens + current)
+            k_cache = k_qx.permute(1, 0, 2).contiguous()  # [H, kv_len, D]
+            v_cache = v_qx.permute(1, 0, 2).contiguous()
+            k_scale_cache = k_scale.permute(1, 0).contiguous()  # [H, kv_len]
+            v_scale_cache = v_scale.permute(1, 0).contiguous()
+
+            k_qx_batched = k_cache.unsqueeze(0).expand(bsz, -1, -1, -1)
+            v_qx_batched = v_cache.unsqueeze(0).expand(bsz, -1, -1, -1)
+            k_scale_batched = k_scale_cache.unsqueeze(0).expand(bsz, -1, -1)
+            v_scale_batched = v_scale_cache.unsqueeze(0).expand(bsz, -1, -1)
+
+            k_qx_batched = torch.cat([k_qx_batched, current_k_qx.unsqueeze(2)], dim=2)
+            v_qx_batched = torch.cat([v_qx_batched, current_v_qx.unsqueeze(2)], dim=2)
+            k_scale_batched = torch.cat([k_scale_batched, current_k_scale.unsqueeze(2)], dim=2)
+            v_scale_batched = torch.cat([v_scale_batched, current_v_scale.unsqueeze(2)], dim=2)
+
+            # Extract causal mask for current position if available
             mask_gpu = None
             if attention_mask is not None:
-                # attention_mask is [bsz, 1, q_len, kv_len], we need to extract for current position
-                mask_gpu = attention_mask[:, 0, -1, :]  # [bsz, kv_len]
-
-            # Call CUDA fused attention kernel
-            # query_states: [bsz, num_heads, 1, head_dim]
-            # k_qx_full: [kv_len, num_heads, head_dim]
-            # We need to add batch dimension to match
-            k_qx_batched = k_qx_full.unsqueeze(0).expand(bsz, -1, -1, -1)  # [bsz, kv_len, num_heads, head_dim]
-            v_qx_batched = v_qx_full.unsqueeze(0).expand(bsz, -1, -1, -1)
-            k_scale_batched = k_scale_full.unsqueeze(0).expand(bsz, -1, -1)  # [bsz, kv_len, num_heads]
-            v_scale_batched = v_scale_full.unsqueeze(0).expand(bsz, -1, -1)
+                mask_gpu = attention_mask[:, :, -1:, :]
 
             attn_output_gpu = quantized_attention(
-                query_states.squeeze(2),  # [bsz, num_heads, head_dim]
+                query_states[:, :, -1:, :],
                 k_qx_batched,
                 k_scale_batched,
                 v_qx_batched,
                 v_scale_batched,
                 attention_mask=mask_gpu,
                 use_cuda=True
-            )  # [bsz, num_heads, head_dim]
+            )
 
-            attn_output = attn_output_gpu.unsqueeze(2).transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+            attn_output = attn_output_gpu.transpose(1, 2).contiguous().view(bsz, q_len, self.hidden_size)
 
         else:
             if self.num_key_value_groups > 1:
@@ -437,6 +453,14 @@ class LlamaSmartKVAttention(nn.Module):
         seq_len = min(key_states.shape[2], len(token_ids))
         if seq_len == 0:
             return
+
+        if batch_size > 1 and not getattr(self, "_smartkv_multi_batch_warned", False):
+            warnings.warn(
+                "SmartKV cache currently stores KV from the first batch item only; "
+                "ensure sequences are aligned when using multi-batch fused generation.",
+                UserWarning
+            )
+            self._smartkv_multi_batch_warned = True
 
         k_batch = key_states[0, :, :seq_len, :].transpose(0, 1).contiguous()
         v_batch = value_states[0, :, :seq_len, :].transpose(0, 1).contiguous()
@@ -660,7 +684,12 @@ class LlamaSmartKV(nn.Module):
                 realloc_freq=self.smartkv_config.realloc_freq,
                 available_bits=self.smartkv_config.available_bits,
                 device=self.smartkv_config.device,
-                special_token_ids=special_tokens
+                special_token_ids=special_tokens,
+                enable_forecast=self.smartkv_config.enable_forecast,
+                forecast_history=self.smartkv_config.forecast_history,
+                forecast_update_interval=self.smartkv_config.forecast_update_interval,
+                forecast_blend=self.smartkv_config.forecast_blend,
+                forecast_lr=self.smartkv_config.forecast_lr,
             )
         
         # Replace attention in each layer

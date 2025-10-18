@@ -6,6 +6,7 @@ allocation to provide mixed-precision KV-cache compression.
 """
 
 import math
+from collections import deque
 import torch
 from typing import Dict, List, Tuple, Optional, Any
 import psutil
@@ -16,6 +17,7 @@ from smartkv.core._quant_cpu import quantize_per_head
 from smartkv.core.quantizers import get_quantizer, QuantizerBase
 from smartkv.core.importance import ImportanceTracker
 from smartkv.core.allocation import greedy_allocation, compute_memory_usage
+from smartkv.core.forecast import ForecastPredictor
 
 # Bit-packing support (GPU only)
 try:
@@ -45,7 +47,12 @@ class SmartKVCache:
         available_bits: List[int] = [2, 3, 4, 8],
         device: str = "cpu",
         special_token_ids: Optional[List[int]] = None,
-        use_bit_packing: bool = True
+        use_bit_packing: bool = True,
+        enable_forecast: bool = False,
+        forecast_history: int = 2048,
+        forecast_update_interval: int = 32,
+        forecast_blend: float = 0.5,
+        forecast_lr: float = 0.05
     ):
         """
         Initialize SmartKV cache.
@@ -82,6 +89,30 @@ class SmartKVCache:
 
         self.scale_dtype = "fp32"  # FP32 scales (can be changed to "fp16")
 
+        self.enable_forecast = bool(enable_forecast and forecast_history > 0)
+        self.forecast_history = max(1, forecast_history)
+        self.forecast_update_interval = max(1, forecast_update_interval)
+        self.forecast_blend = float(max(0.0, min(1.0, forecast_blend)))
+        self.forecast_lr = float(max(forecast_lr, 1e-5))
+        self._forecast_feature_dim = 6
+        if self.enable_forecast:
+            self.forecast_feature_buffer = deque(maxlen=self.forecast_history)
+            self.forecast_target_buffer = deque(maxlen=self.forecast_history)
+            self.forecast_pending: Dict[int, Tuple[torch.Tensor, int]] = {}
+            self.forecast_last_importance: Dict[int, float] = {}
+            self.forecast_last_loss: Optional[float] = None
+            self.forecast_predictor = ForecastPredictor(
+                feature_dim=self._forecast_feature_dim,
+                lr=self.forecast_lr,
+            )
+        else:
+            self.forecast_feature_buffer = None
+            self.forecast_target_buffer = None
+            self.forecast_pending = {}
+            self.forecast_last_importance = {}
+            self.forecast_last_loss = None
+            self.forecast_predictor = None
+
         # Validate and adjust memory budget
         from smartkv.core.allocation import compute_minimum_budget
         self.min_budget = compute_minimum_budget(
@@ -100,7 +131,11 @@ class SmartKVCache:
                 f"Clamping to minimum budget.",
                 UserWarning
             )
-            self.memory_budget = self.min_budget
+            if memory_budget < 0.5:
+                self.memory_budget = self.min_budget
+            else:
+                # Allow legacy 0.5 default while still warning
+                self.memory_budget = memory_budget
         else:
             self.memory_budget = memory_budget
 
@@ -116,7 +151,7 @@ class SmartKVCache:
         self.last_seen: Dict[int, int] = {}
         self.critical_token_window = 4
         self.critical_min_bits = max(self.available_bits)
-        self.min_general_bits = min((b for b in self.available_bits if b >= 3), default=self.available_bits[-1])
+        self.min_general_bits = min(self.available_bits)
         
         # Importance tracking
         self.importance_tracker = ImportanceTracker(
@@ -196,6 +231,9 @@ class SmartKVCache:
         current_step = self.global_step
         for token_id in token_ids:
             self.last_seen[int(token_id)] = current_step
+            if self.enable_forecast:
+                actual_importance = self.importance_tracker.get_importance(int(token_id))
+                self._record_forecast_target(int(token_id), actual_importance)
 
         # Adaptive reallocation frequency based on context length
         # Scale frequency with number of tokens to reduce overhead at long context
@@ -206,10 +244,10 @@ class SmartKVCache:
 
         # Periodically reallocate precision
         if self.token_counter % adaptive_freq == 0:
-            self.allocate_precision(token_ids)
+            self.allocate_precision(layer_idx, token_ids)
             self.realloc_counter += 1
     
-    def allocate_precision(self, token_ids: List[int]) -> Dict[int, int]:
+    def allocate_precision(self, layer_idx: int, token_ids: List[int]) -> Dict[int, int]:
         """
         Allocate precision to tokens based on importance.
 
@@ -222,105 +260,291 @@ class SmartKVCache:
         if not token_ids:
             return {}
 
-        # Get base importance scores
-        importance_scores = {
-            tid: self.importance_tracker.get_importance(tid)
-            for tid in token_ids
-        }
+        candidate_tokens = set(token_ids)
+        candidate_tokens.update(self.precision_map.keys())
+        candidate_tokens.update(token_id for (_, token_id) in self.k_cache.keys())
 
-        # Recency weighting
-        if self.recency_temperature > 0:
-            for tid in token_ids:
-                age = self.global_step - self.last_seen.get(tid, self.global_step)
-                importance_scores[tid] *= math.exp(-age / self.recency_temperature)
-
-        protected_set = self.protected_tokens | self.special_token_ids
-        for tid in token_ids:
-            if tid in protected_set or tid < self.critical_token_window:
-                importance_scores[tid] = float('inf')
-
-        sorted_tokens = sorted(token_ids, key=lambda tid: importance_scores.get(tid, 0.0), reverse=True)
-        if not sorted_tokens:
+        if not candidate_tokens:
             return {}
 
-        tiers = [0.1, 0.3, 0.7, 1.0]
-        bits_order = self.available_bits + [self.available_bits[-1]] * 4
-        tier_alloc: Dict[int, int] = {}
-        total = len(sorted_tokens)
-        for idx, tid in enumerate(sorted_tokens):
-            frac = (idx + 1) / total
-            tier_idx = next((i for i, edge in enumerate(tiers) if frac <= edge), len(self.available_bits) - 1)
-            tier_idx = min(tier_idx, len(bits_order) - 1)
-            tier_bits = max(bits_order[tier_idx], self.min_general_bits)
-            tier_alloc[tid] = tier_bits
+        protected_set = self.protected_tokens | self.special_token_ids
 
-        # Ensure protected / early tokens have maximum precision
-        for tid in sorted_tokens:
+        importance_scores: Dict[int, float] = {}
+        for tid in candidate_tokens:
+            score = self.importance_tracker.get_importance(tid)
+            if self.recency_temperature > 0:
+                age = self.global_step - self.last_seen.get(tid, self.global_step)
+                score *= math.exp(-age / self.recency_temperature)
             if tid in protected_set or tid < self.critical_token_window:
-                tier_alloc[tid] = self.critical_min_bits
+                score = float('inf')
+            importance_scores[tid] = score
 
-        # Top 5% tokens also get maximum bits
-        top_count = max(1, int(0.05 * len(sorted_tokens)))
-        for tid in sorted_tokens[:top_count]:
-            tier_alloc[tid] = max(tier_alloc[tid], self.available_bits[0])
+        if self.enable_forecast and self.forecast_predictor is not None:
+            feature_batch = []
+            token_batch = []
+            raw_batch = []
+            for tid, score in importance_scores.items():
+                if not math.isfinite(score) or score <= 0.0:
+                    continue
+                feature = self._build_forecast_feature(tid, score)
+                feature_batch.append(feature)
+                token_batch.append(tid)
+                raw_batch.append(score)
+                self.forecast_pending[tid] = (feature, self.global_step)
+            if feature_batch:
+                stacked = torch.stack(feature_batch)
+                preds = self.forecast_predictor.predict(stacked).cpu()
+                for tid, raw_score, pred in zip(token_batch, raw_batch, preds.tolist()):
+                    blended = (1.0 - self.forecast_blend) * raw_score + self.forecast_blend * max(pred, 0.0)
+                    importance_scores[tid] = blended
+                    self.forecast_last_importance[tid] = raw_score
 
-        def compute_ratio(mapping: Dict[int, int]) -> tuple:
-            stats = compute_memory_usage(
-                mapping,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                scale_dtype=self.scale_dtype,
-                use_packing=self.use_packing
-            )
-            # Return both ratios for logging
-            return stats.get('memory_ratio_true', 0.0), stats
+        if self.enable_forecast:
+            for tid, score in importance_scores.items():
+                if math.isfinite(score):
+                    self.forecast_last_importance[tid] = score
 
-        def lower_bits(bits: int) -> int:
-            if bits not in self.available_bits:
-                return self.available_bits[-1]
-            idx = self.available_bits.index(bits)
-            next_bits = bits if idx == len(self.available_bits) - 1 else self.available_bits[idx + 1]
-            return max(next_bits, self.min_general_bits)
+        allocation = self._solve_allocation(candidate_tokens, importance_scores, protected_set)
 
-        # Global budget enforcement: check merged map before committing
-        merged_map = {**self.precision_map, **tier_alloc}
-        budget_ratio, stats = compute_ratio(merged_map)
+        previous_map = dict(self.precision_map)
+        self.precision_map = allocation
 
-        if budget_ratio > self.memory_budget:
-            while budget_ratio > self.memory_budget:
-                changed = False
-                for tid in reversed(sorted_tokens):
-                    if tid in protected_set or tid < self.critical_token_window:
-                        continue
-                    old_bits = tier_alloc[tid]
-                    new_bits = lower_bits(old_bits)
-                    if new_bits == old_bits:
-                        continue
-                    tier_alloc[tid] = new_bits
-                    # Recompute on merged map
-                    merged_map = {**self.precision_map, **tier_alloc}
-                    budget_ratio, stats = compute_ratio(merged_map)
-                    changed = True
-                    if budget_ratio <= self.memory_budget:
-                        break
-                if not changed:
-                    break
+        changed_tokens = {
+            tid for tid, bits in allocation.items()
+            if previous_map.get(tid) != bits
+        }
 
-        self.precision_map.update(tier_alloc)
+        if changed_tokens:
+            self._requantize_tokens(changed_tokens)
 
-        # Log dual budget reporting
+        return {tid: allocation[tid] for tid in token_ids if tid in allocation}
+
+    def _solve_allocation(
+        self,
+        tokens: set,
+        importance_scores: Dict[int, float],
+        protected_set: set
+    ) -> Dict[int, int]:
+        available_bits = sorted(self.available_bits, reverse=True)
+        min_bits = min(self.available_bits)
+        max_bits = max(self.available_bits)
+
+        allocation = {tid: min_bits for tid in tokens}
+
+        for tid in tokens:
+            if tid in protected_set or tid < self.critical_token_window:
+                allocation[tid] = max_bits
+
+        sorted_tokens = sorted(
+            (tid for tid in tokens if tid not in protected_set and tid >= self.critical_token_window),
+            key=lambda tid: importance_scores.get(tid, 0.0),
+            reverse=True
+        )
+
+        for tid in sorted_tokens:
+            best_bits = allocation[tid]
+            for bits in available_bits:
+                if bits <= best_bits:
+                    continue
+                allocation[tid] = bits
+                ratio, _ = self._allocation_stats(allocation)
+                if ratio <= self.memory_budget + 1e-6:
+                    best_bits = bits
+                else:
+                    allocation[tid] = best_bits
+            allocation[tid] = best_bits
+
+        ratio, stats = self._allocation_stats(allocation)
         if hasattr(self, '_logger') and self._logger:
             self._logger.debug(
-                f"Budget enforcement: "
-                f"Theoretical={stats.get('memory_ratio', 0.0):.3f} "
-                f"(avg {stats.get('avg_bits', 0.0):.2f} bits), "
-                f"True={budget_ratio:.3f} "
-                f"({stats.get('storage_mode', 'unknown')} + {stats.get('scale_dtype', 'unknown')} scales), "
-                f"Target={self.memory_budget:.3f}, "
-                f"Tokens={stats.get('num_tokens', 0)}"
+                "Allocation stats: "
+                f"True={ratio:.3f} (target {self.memory_budget:.3f}), "
+                f"avg_bits={stats.get('avg_bits', 0.0):.2f}, tokens={stats.get('num_tokens', 0)}"
             )
 
-        return tier_alloc
+        return allocation
+
+    def _allocation_stats(self, allocation: Dict[int, int]) -> Tuple[float, Dict[str, float]]:
+        stats = compute_memory_usage(
+            allocation,
+            num_heads=self.num_heads,
+            head_dim=self.head_dim,
+            scale_dtype=self.scale_dtype,
+            use_packing=self.use_packing
+        )
+        return stats.get('memory_ratio_true', 0.0), stats
+
+    def _build_forecast_feature(self, token_id: int, raw_importance: float) -> torch.Tensor:
+        if not self.enable_forecast:
+            raise RuntimeError("Forecasting disabled")
+
+        last_importance = self.forecast_last_importance.get(token_id, 0.0)
+        delta = raw_importance - last_importance
+
+        age = self.global_step - self.last_seen.get(token_id, self.global_step)
+        age_norm = math.tanh(age / max(self.recency_temperature, 1.0))
+
+        current_bits = float(self.precision_map.get(token_id, self.min_general_bits))
+        bits_norm = current_bits / max(self.available_bits)
+
+        head_mean = float(self.head_importance.mean().item()) if isinstance(self.head_importance, torch.Tensor) else float(self.head_importance)
+        head_norm = math.tanh(head_mean)
+
+        position_norm = math.tanh(token_id / max(1.0, self.total_tokens_stored + 1))
+        step_norm = math.tanh(self.global_step / max(1.0, self.recency_temperature * 10.0))
+
+        feature = torch.tensor([
+            math.log1p(max(raw_importance, 0.0)),
+            math.log1p(abs(delta)),
+            age_norm,
+            bits_norm,
+            head_norm,
+            position_norm + step_norm,
+        ], dtype=torch.float32)
+        return feature
+
+    def _record_forecast_target(self, token_id: int, actual_importance: float) -> None:
+        if not self.enable_forecast:
+            return
+        pending = self.forecast_pending.pop(token_id, None)
+        if pending is None:
+            return
+
+        feature, step = pending
+        if not math.isfinite(actual_importance):
+            return
+
+        target = math.log1p(max(actual_importance, 0.0))
+        self.forecast_feature_buffer.append(feature.detach().cpu())
+        self.forecast_target_buffer.append(target)
+
+        if len(self.forecast_feature_buffer) >= self.forecast_update_interval:
+            self._update_forecast_predictor()
+
+    def _update_forecast_predictor(self) -> None:
+        if not self.enable_forecast or self.forecast_predictor is None:
+            return
+        if not self.forecast_feature_buffer:
+            return
+
+        features = torch.stack(list(self.forecast_feature_buffer))
+        targets = torch.tensor(list(self.forecast_target_buffer), dtype=torch.float32)
+        loss = self.forecast_predictor.update(features, targets)
+        self.forecast_last_loss = loss
+        self.forecast_feature_buffer.clear()
+        self.forecast_target_buffer.clear()
+
+    def _requantize_tokens(self, tokens: set) -> None:
+        if not tokens:
+            return
+
+        cache_items = list(self.k_cache.items())
+        for (layer_idx, token_id), meta in cache_items:
+            if token_id not in tokens:
+                continue
+            new_bits = self.precision_map.get(token_id)
+            if new_bits is None:
+                continue
+            self._requantize_single(layer_idx, token_id, int(new_bits))
+
+    def _requantize_single(self, layer_idx: int, token_id: int, bits: int) -> None:
+        cache_key = (layer_idx, token_id)
+        meta = self.k_cache.get(cache_key)
+        if meta is None:
+            return
+
+        layer_store = self.layer_store[layer_idx]
+        slot = int(meta['index'])
+        indices = torch.tensor([slot], dtype=torch.long)
+        keys, values = self._dequantize_indices(layer_store, indices)
+        if keys.numel() == 0:
+            return
+
+        k_float = keys[0].to(self.device)
+        v_float = values[0].to(self.device)
+
+        k_q, v_q, k_scale, v_scale = self._quantize_kv_pair(k_float, v_float, bits)
+        self._write_quantized_slot(layer_store, slot, bits, k_q, v_q, k_scale, v_scale)
+
+        meta['bits'] = bits
+        meta['qx'] = layer_store['k_qx'][slot]
+        meta['scale'] = layer_store['k_scale'][slot]
+        self.v_cache[cache_key]['bits'] = bits
+        self.v_cache[cache_key]['qx'] = layer_store['v_qx'][slot]
+        self.v_cache[cache_key]['scale'] = layer_store['v_scale'][slot]
+
+    def _quantize_kv_pair(
+        self,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        bits: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        k_input = k_tensor.unsqueeze(0)
+        v_input = v_tensor.unsqueeze(0)
+
+        if self.device == 'cuda':
+            try:
+                from smartkv.core._quant_cuda import quantize_per_head_cuda
+                k_q, v_q, k_scale, v_scale = quantize_per_head_cuda(k_input, v_input, bits)
+            except ImportError:
+                k_cpu = k_input.cpu()
+                v_cpu = v_input.cpu()
+                k_q, v_q, k_scale, v_scale = quantize_per_head(k_cpu, v_cpu, bits)
+                k_q = k_q.to(self.device)
+                v_q = v_q.to(self.device)
+                k_scale = k_scale.to(self.device)
+                v_scale = v_scale.to(self.device)
+        else:
+            k_q, v_q, k_scale, v_scale = quantize_per_head(k_input, v_input, bits)
+
+        return (
+            k_q.squeeze(0),
+            v_q.squeeze(0),
+            k_scale.squeeze(0),
+            v_scale.squeeze(0)
+        )
+
+    def _write_quantized_slot(
+        self,
+        layer_store: Dict[str, Any],
+        slot: int,
+        bits: int,
+        k_q: torch.Tensor,
+        v_q: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor
+    ) -> None:
+        # Ensure tensors are on correct device
+        k_device = layer_store['k_qx'].device if layer_store['k_qx'] is not None else self.device
+        v_device = layer_store['v_qx'].device if layer_store['v_qx'] is not None else self.device
+
+        k_scale_device = layer_store['k_scale'].device if layer_store['k_scale'] is not None else self.device
+        v_scale_device = layer_store['v_scale'].device if layer_store['v_scale'] is not None else self.device
+
+        layer_store['k_scale'][slot] = k_scale.to(k_scale_device)
+        layer_store['v_scale'][slot] = v_scale.to(v_scale_device)
+        layer_store['bits'][slot] = bits
+
+        if self.use_packing and bits < 8:
+            k_vec = k_q.contiguous().unsqueeze(0)
+            v_vec = v_q.contiguous().unsqueeze(0)
+
+            layer_store['k_packed'][slot] = pack_tensor(k_vec.flatten().to(k_device), bits)
+            layer_store['v_packed'][slot] = pack_tensor(v_vec.flatten().to(v_device), bits)
+            layer_store['k_shapes'][slot] = tuple(k_vec.shape)
+            layer_store['v_shapes'][slot] = tuple(v_vec.shape)
+
+            layer_store['k_qx'][slot] = torch.zeros_like(layer_store['k_qx'][slot])
+            layer_store['v_qx'][slot] = torch.zeros_like(layer_store['v_qx'][slot])
+        else:
+            if self.use_packing:
+                layer_store['k_packed'].pop(slot, None)
+                layer_store['v_packed'].pop(slot, None)
+                layer_store['k_shapes'].pop(slot, None)
+                layer_store['v_shapes'].pop(slot, None)
+
+            layer_store['k_qx'][slot] = k_q.to(k_device)
+            layer_store['v_qx'][slot] = v_q.to(v_device)
 
     def _init_layer_store(self) -> Dict[str, Any]:
         """Create empty storage buffers for a layer."""
@@ -753,13 +977,22 @@ class SmartKVCache:
         """
         # Compute memory usage from precision map
         if self.precision_map:
-            allocation_stats = compute_memory_usage(self.precision_map)
+            allocation_stats = compute_memory_usage(
+                self.precision_map,
+                num_heads=self.num_heads,
+                head_dim=self.head_dim,
+                scale_dtype=self.scale_dtype,
+                use_packing=self.use_packing
+            )
         else:
             allocation_stats = {
                 'total_bits': 0,
                 'avg_bits': 0.0,
                 'memory_ratio': 0.0,
-                'num_tokens': 0
+                'memory_ratio_true': 0.0,
+                'num_tokens': 0,
+                'storage_mode': 'packed' if self.use_packing else 'int8',
+                'scale_dtype': self.scale_dtype
             }
         
         # Count cache entries
@@ -781,6 +1014,7 @@ class SmartKVCache:
         return {
             'memory_budget': self.memory_budget,
             'memory_ratio': allocation_stats['memory_ratio'],
+            'memory_ratio_true': allocation_stats.get('memory_ratio_true', allocation_stats['memory_ratio']),
             'avg_bits': allocation_stats['avg_bits'],
             'num_tokens': allocation_stats['num_tokens'],
             'num_cache_entries': num_cache_entries,
@@ -788,6 +1022,8 @@ class SmartKVCache:
             'total_tokens_stored': self.total_tokens_stored,
             'realloc_count': self.realloc_counter,
             'system_memory_mb': system_memory_mb,
+            'storage_mode': allocation_stats.get('storage_mode'),
+            'scale_dtype': allocation_stats.get('scale_dtype'),
         }
     
     def get_precision(self, token_id: int) -> int:

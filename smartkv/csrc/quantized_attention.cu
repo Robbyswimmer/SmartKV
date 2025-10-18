@@ -267,16 +267,32 @@ torch::Tensor quantized_attention_forward(
     return output;
 }
 
-// Per-head quantization kernel (placeholder)
 std::tuple<torch::Tensor, torch::Tensor> quantize_per_head_forward(
     torch::Tensor input,
     int bits
 ) {
-    // NOTE: Placeholder - use PyTorch version from _quant_cuda.py for now
-    // Will implement optimized CUDA kernel in Phase 2.2
+    TORCH_CHECK(input.is_cuda(), "input must be on CUDA");
+    TORCH_CHECK(input.dim() == 3, "input must have shape [N, H, D]");
 
-    auto quantized = torch::zeros_like(input, torch::kInt8);
-    auto scales = torch::zeros({input.size(0), input.size(1)}, input.options());
+    auto input_f32 = input.to(torch::kFloat32);
+    const int64_t N = input_f32.size(0);
+    const int64_t H = input_f32.size(1);
 
-    return std::make_tuple(quantized, scales);
+    int max_val = (bits == 1) ? 0 : (1 << (bits - 1)) - 1;
+    int min_val = (bits == 1) ? 0 : -(1 << (bits - 1));
+    float denom = static_cast<float>(std::max(max_val, 1));
+
+    // Per-head absolute max
+    auto abs_max = input_f32.abs().amax(/*dim=*/2, /*keepdim=*/true);
+    auto scale = abs_max / denom;
+    auto ones = torch::ones_like(scale, scale.options());
+    scale = torch::where(scale == 0, ones, scale);
+
+    auto quantized = torch::round(input_f32 / scale)
+                         .clamp(min_val, max_val)
+                         .to(torch::kInt8);
+
+    auto scale_out = scale.view({N, H});
+
+    return std::make_tuple(quantized, scale_out);
 }
