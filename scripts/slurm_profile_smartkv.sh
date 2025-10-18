@@ -13,6 +13,11 @@ set -euo pipefail
 
 export PYTHONUNBUFFERED=1
 
+# Navigate to project directory
+PROJECT_DIR=/data/SalmanAsif/RobbyMoseley/SmartKV/SmartKV
+cd "${PROJECT_DIR}"
+echo "Working directory: $(pwd)"
+
 if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
   source "$HOME/miniconda3/etc/profile.d/conda.sh"
 elif command -v module &>/dev/null; then
@@ -28,9 +33,14 @@ mkdir -p logs
 
 # Build CUDA extensions for the assigned GPU
 echo "Building CUDA extensions for this GPU..."
-cd "$(dirname "$(dirname "$0")")" || exit 1
-pip install -e . --no-build-isolation --quiet 2>&1 | grep -v "Requirement already satisfied" || true
-python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'CUDA kernels available: {CUDA_AVAILABLE}')"
+echo "Checking CUDA availability..."
+python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_available()}')"
+
+pip uninstall smartkv -y -q
+pip install -e . --no-build-isolation 2>&1 | tee logs/build_output.log
+
+echo "Verifying CUDA kernels..."
+python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"
 echo "CUDA build complete."
 
 PROFILE_DEVICE=${PROFILE_DEVICE:-cuda}

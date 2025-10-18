@@ -32,8 +32,14 @@ mkdir -p logs experiments
 
 # Build CUDA extensions for the assigned GPU
 echo "Building CUDA extensions for this GPU..."
-pip install -e . --no-build-isolation --quiet 2>&1 | grep -v "Requirement already satisfied" || true
-python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'CUDA kernels available: {CUDA_AVAILABLE}')"
+echo "Checking CUDA availability..."
+python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_available()}')"
+
+pip uninstall smartkv -y -q
+pip install -e . --no-build-isolation 2>&1 | tee logs/build_output.log
+
+echo "Verifying CUDA kernels..."
+python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"
 echo "CUDA build complete."
 
 # Configuration
