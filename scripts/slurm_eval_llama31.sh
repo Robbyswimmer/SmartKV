@@ -1,0 +1,64 @@
+#!/bin/bash -l
+
+#SBATCH --job-name="SmartKV-Llama31-Eval"
+#SBATCH --output=logs/llama31_eval_%j.txt
+#SBATCH --error=logs/llama31_eval_%j.err
+#SBATCH --time=04:00:00
+#SBATCH --mem=64G
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --partition=gpu
+
+set -euo pipefail
+
+export PYTHONUNBUFFERED=1
+
+# Navigate to project directory
+cd /data/SalmanAsif/RobbyMoseley/SmartKV/SmartKV
+
+# Activate conda environment
+if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
+  source "$HOME/miniconda3/etc/profile.d/conda.sh"
+elif command -v module &>/dev/null; then
+  module load anaconda &>/dev/null || true
+  source "$HOME/.bashrc"
+fi
+
+CONDA_ENV=${CONDA_ENV:-smartkv}
+echo "Activating conda environment '${CONDA_ENV}'"
+conda activate "${CONDA_ENV}"
+
+mkdir -p logs experiments
+
+# Build CUDA extensions for the assigned GPU
+echo "Building CUDA extensions for this GPU..."
+pip install -e . --no-build-isolation --quiet 2>&1 | grep -v "Requirement already satisfied" || true
+python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'CUDA kernels available: {CUDA_AVAILABLE}')"
+echo "CUDA build complete."
+
+# Configuration
+MODEL_PATH=${MODEL_PATH:-/data/SalmanAsif/RobbyMoseley/SmartKV/SmartKV/models/llama-3.1-8b}
+DEVICE=${DEVICE:-cuda}
+BUDGET=${BUDGET:-0.5}
+MAX_TOKENS=${MAX_TOKENS:-50}
+OUTPUT_DIR=${OUTPUT_DIR:-experiments/llama31_eval}
+
+echo ""
+echo "=== SmartKV Comprehensive Evaluation ==="
+echo "Model: ${MODEL_PATH}"
+echo "Device: ${DEVICE}"
+echo "Memory Budget: ${BUDGET}"
+echo "Max Tokens: ${MAX_TOKENS}"
+echo "Output: ${OUTPUT_DIR}"
+echo ""
+
+# Run comprehensive evaluation
+python -u smartkv/experiments/comprehensive_evaluation.py \
+    --model "${MODEL_PATH}" \
+    --device "${DEVICE}" \
+    --budget "${BUDGET}" \
+    --max-tokens "${MAX_TOKENS}" \
+    --output-dir "${OUTPUT_DIR}"
+
+echo ""
+echo "=== Evaluation Complete at $(date) ==="
