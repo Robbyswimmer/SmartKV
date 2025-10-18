@@ -30,6 +30,15 @@ conda activate "${CONDA_ENV}"
 
 mkdir -p logs experiments
 
+# Install modern GCC compiler for CUDA compilation
+echo "Installing GCC 11 for CUDA compilation..."
+conda install -y -c conda-forge gxx_linux-64=11 -q
+
+# Set compiler environment variables
+export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
+export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
+echo "Using GCC: $(${CXX} --version | head -1)"
+
 # Build CUDA extensions for the assigned GPU
 echo "Building CUDA extensions for this GPU..."
 echo "Checking CUDA availability..."
