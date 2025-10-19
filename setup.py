@@ -44,6 +44,7 @@ try:
             '-O3',
             '--use_fast_math',
             '--expt-relaxed-constexpr',
+            '-std=c++17',
             # Support multiple GPU architectures
             '-gencode=arch=compute_70,code=sm_70',  # V100
             '-gencode=arch=compute_75,code=sm_75',  # T4, RTX 20xx
@@ -57,7 +58,7 @@ try:
         if conda_prefix:
             conda_cxx = os.path.join(conda_prefix, 'bin', 'x86_64-conda-linux-gnu-g++')
             if os.path.exists(conda_cxx):
-                nvcc_args.insert(0, f'-ccbin={conda_cxx}')
+                nvcc_args = ['-ccbin', conda_cxx] + nvcc_args
                 print(f"[setup.py] Using conda g++: {conda_cxx}")
 
         ext_modules = [
