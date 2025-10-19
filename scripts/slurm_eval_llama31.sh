@@ -69,8 +69,34 @@ pip install -e . --no-build-isolation 2>&1 | tee logs/build_output.log
 echo "Compiling CUDA extensions..."
 CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace 2>&1 | tee -a logs/build_output.log
 
+# Ensure the .so file is findable (check both possible locations)
+echo "Locating compiled extension..."
+SO_FILE=$(find . -name "smartkv_cuda*.so" -type f 2>/dev/null | head -1)
+if [[ -n "${SO_FILE}" ]]; then
+    echo "Found extension: ${SO_FILE}"
+    # Copy to root if not already there
+    if [[ ! -f "./smartkv_cuda$(basename ${SO_FILE} | grep -o '\..*')" ]]; then
+        cp "${SO_FILE}" .
+        echo "Copied to project root for import"
+    fi
+else
+    echo "WARNING: No .so file found after build!"
+fi
+
 echo "Verifying CUDA kernels..."
 python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"
+
+echo "Testing CUDA kernel import directly..."
+python -c "
+try:
+    import smartkv_cuda
+    print('Direct import of smartkv_cuda: SUCCESS')
+    print(f'Module location: {smartkv_cuda.__file__}')
+except ImportError as e:
+    print(f'Direct import of smartkv_cuda: FAILED - {e}')
+    import sys
+    print(f'Python path: {sys.path[:3]}')
+"
 echo "CUDA build complete."
 
 # Configuration
