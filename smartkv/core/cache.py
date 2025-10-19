@@ -54,8 +54,10 @@ class SmartKVCache:
         forecast_update_interval: int = 32,
         forecast_blend: float = 0.5,
         forecast_lr: float = 0.05,
-        utility_alpha: float = 0.6,
-        importance_floor: float = 1e-6
+        utility_alpha: float = 0.5,
+        importance_floor: float = 1e-6,
+        hysteresis_rank_threshold: float = 0.05,
+        hysteresis_intervals: int = 2
     ):
         """
         Initialize SmartKV cache.
@@ -73,6 +75,8 @@ class SmartKVCache:
             use_bit_packing: Enable bit-packing for sub-byte storage (GPU only, requires CUDA)
             utility_alpha: Exponent for diminishing returns in precision utility (0 < alpha ≤ 1)
             importance_floor: Minimum effective importance to keep spare budget useful
+            hysteresis_rank_threshold: Minimum percentile rank change to consider reallocating a token
+            hysteresis_intervals: Number of consecutive reallocations the threshold must be exceeded
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -120,6 +124,9 @@ class SmartKVCache:
 
         self.utility_alpha = float(utility_alpha) if utility_alpha > 0 else 1.0
         self.importance_floor = float(max(importance_floor, 0.0))
+        self.hysteresis_rank_threshold = float(max(hysteresis_rank_threshold, 0.0))
+        self.hysteresis_intervals = max(int(hysteresis_intervals), 1)
+        self._rank_state: Dict[int, Dict[str, float]] = {}
 
         # Validate and adjust memory budget
         from smartkv.core.allocation import compute_minimum_budget
@@ -371,6 +378,36 @@ class SmartKVCache:
                 return float(bits)
             return float(math.pow(bits, utility_alpha))
 
+        # Compute rank percentiles for hysteresis thresholding
+        ranked_tokens = sorted(
+            (tid for tid in tokens if tid not in protected_set and tid >= self.critical_token_window),
+            key=lambda tid: importance_scores.get(tid, 0.0),
+            reverse=True
+        )
+        rank_percent: Dict[int, float] = {}
+        if ranked_tokens:
+            denom = max(len(ranked_tokens) - 1, 1)
+            for idx, tid in enumerate(ranked_tokens):
+                pct = 0.0 if len(ranked_tokens) == 1 else idx / denom
+                state = self._rank_state.get(tid)
+                if state is None:
+                    self._rank_state[tid] = {"pct": pct, "streak": self.hysteresis_intervals}
+                else:
+                    prev_pct = state.get("pct", pct)
+                    delta = abs(pct - prev_pct)
+                    if delta >= self.hysteresis_rank_threshold:
+                        streak = min(state.get("streak", 0) + 1, self.hysteresis_intervals)
+                    else:
+                        streak = 0
+                    self._rank_state[tid] = {"pct": pct, "streak": streak}
+                rank_percent[tid] = pct
+        # Ensure protected or out-of-window tokens have state entries for completeness
+        for tid in tokens:
+            if tid in rank_percent:
+                continue
+            if tid not in self._rank_state:
+                self._rank_state[tid] = {"pct": 1.0, "streak": self.hysteresis_intervals}
+
         bit_index = {bits: idx for idx, bits in enumerate(available_bits_asc)}
         heap: List[Tuple[float, int, int, int]] = []
 
@@ -386,6 +423,10 @@ class SmartKVCache:
                 if self.importance_floor <= 0.0:
                     return
                 importance = self.importance_floor
+            state = self._rank_state.get(token_id)
+            if state is not None and token_id in rank_percent:
+                if state.get("streak", 0) < self.hysteresis_intervals:
+                    return
             util_gain = utility(next_bits) - utility(current_bits)
             if util_gain <= 0.0:
                 return
@@ -422,6 +463,12 @@ class SmartKVCache:
             allocation[tid] = next_bits
             current_payload_bits += delta_payload
             current_ratio = ratio_candidate
+
+            state = self._rank_state.get(tid)
+            if state is not None:
+                state["streak"] = 0
+                state["pct"] = rank_percent.get(tid, state.get("pct", 1.0))
+                self._rank_state[tid] = state
 
             enqueue(tid, next_bits)
 
