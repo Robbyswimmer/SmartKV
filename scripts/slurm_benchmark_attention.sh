@@ -37,6 +37,17 @@ PY
 then
   echo "smartkv_cuda not found; building extension..."
   pip install -e . --no-build-isolation
+  python setup.py build_ext --inplace
+fi
+
+if ! python - <<'PY'
+import importlib
+import sys
+sys.exit(0 if importlib.util.find_spec('smartkv_cuda') else 1)
+PY
+then
+  echo "ERROR: smartkv_cuda extension is still unavailable after build." >&2
+  exit 1
 fi
 
 : "${CONTEXT_LENGTH:=4096}"
@@ -58,4 +69,3 @@ python scripts/benchmark_gpu_attention.py \
   --warmup "$WARMUP" \
   --seed "$SEED" \
   --enable-packing
-
