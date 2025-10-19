@@ -231,7 +231,7 @@ torch::Tensor quantized_attention_forward(
 
     // Kernel launch configuration
     dim3 grid(B, H, q_len);
-    int block_size = std::min(k_len, 256);
+    int block_size = std::min(static_cast<int>(k_len), 256);
     dim3 block(block_size);
 
     // Shared memory: query + scores + scratch
