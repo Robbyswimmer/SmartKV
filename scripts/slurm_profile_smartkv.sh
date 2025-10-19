@@ -45,7 +45,7 @@ set -u  # Re-enable unbound variable check
 export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
 export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
 export CUDAHOSTCXX=${CXX}
-export NVCC_PREPEND_FLAGS="-ccbin ${CXX}"
+export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9"
 echo "Using GCC: $(${CXX} --version | head -1)"
 
 # Build CUDA extensions for the assigned GPU
@@ -57,9 +57,9 @@ python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_availabl
 pip uninstall smartkv -y -q
 pip install -e . --no-build-isolation 2>&1 | tee logs/build_output.log
 
-# Force build CUDA extensions
+# Force build CUDA extensions with explicit compiler
 echo "Compiling CUDA extensions..."
-python setup.py build_ext --inplace 2>&1 | tee -a logs/build_output.log
+CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace 2>&1 | tee -a logs/build_output.log
 
 echo "Verifying CUDA kernels..."
 python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"

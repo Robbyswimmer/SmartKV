@@ -38,6 +38,28 @@ try:
     # Build CUDA extensions if compiler is available
     if cuda_available:
         print("[setup.py] Building CUDA extensions...")
+
+        # Use conda's GCC if available
+        nvcc_args = [
+            '-O3',
+            '--use_fast_math',
+            '--expt-relaxed-constexpr',
+            # Support multiple GPU architectures
+            '-gencode=arch=compute_70,code=sm_70',  # V100
+            '-gencode=arch=compute_75,code=sm_75',  # T4, RTX 20xx
+            '-gencode=arch=compute_80,code=sm_80',  # A100
+            '-gencode=arch=compute_86,code=sm_86',  # RTX 30xx
+            '-gencode=arch=compute_89,code=sm_89',  # RTX 40xx
+        ]
+
+        # Add ccbin if using conda compiler
+        conda_prefix = os.environ.get('CONDA_PREFIX')
+        if conda_prefix:
+            conda_cxx = os.path.join(conda_prefix, 'bin', 'x86_64-conda-linux-gnu-g++')
+            if os.path.exists(conda_cxx):
+                nvcc_args.insert(0, f'-ccbin={conda_cxx}')
+                print(f"[setup.py] Using conda g++: {conda_cxx}")
+
         ext_modules = [
             CUDAExtension(
                 name='smartkv_cuda',
@@ -51,17 +73,7 @@ try:
                 ],
                 extra_compile_args={
                     'cxx': ['-O3', '-std=c++17'],
-                    'nvcc': [
-                        '-O3',
-                        '--use_fast_math',
-                        '--expt-relaxed-constexpr',
-                        # Support multiple GPU architectures
-                        '-gencode=arch=compute_70,code=sm_70',  # V100
-                        '-gencode=arch=compute_75,code=sm_75',  # T4, RTX 20xx
-                        '-gencode=arch=compute_80,code=sm_80',  # A100
-                        '-gencode=arch=compute_86,code=sm_86',  # RTX 30xx
-                        '-gencode=arch=compute_89,code=sm_89',  # RTX 40xx
-                    ]
+                    'nvcc': nvcc_args
                 }
             )
         ]
