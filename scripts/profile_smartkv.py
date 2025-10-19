@@ -10,28 +10,11 @@ import argparse
 import json
 import time
 from typing import Dict
-import os
-import sys
 
 import torch
 
-# Diagnostic: Check environment before importing smartkv
-print(f"[DIAGNOSTIC] LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'NOT SET')[:200]}...")
-print(f"[DIAGNOSTIC] Python sys.path[0]: {sys.path[0]}")
-print(f"[DIAGNOSTIC] Current working directory: {os.getcwd()}")
-
-# Try direct import first to diagnose
-try:
-    import smartkv_cuda
-    print(f"[DIAGNOSTIC] Direct smartkv_cuda import: SUCCESS")
-    print(f"[DIAGNOSTIC] Module location: {smartkv_cuda.__file__}")
-except ImportError as e:
-    print(f"[DIAGNOSTIC] Direct smartkv_cuda import: FAILED - {e}")
-
 from smartkv.kernels import quantized_attention, CUDA_AVAILABLE
 from smartkv.core.cache import SmartKVCache
-
-print(f"[DIAGNOSTIC] CUDA_AVAILABLE after smartkv.kernels import: {CUDA_AVAILABLE}")
 
 
 def _sync(device: torch.device) -> None:
@@ -95,6 +78,7 @@ def benchmark_attention(args: argparse.Namespace) -> Dict[str, float]:
         attention_mask[..., args.k_len // 2 :] = -1e9
 
     # Warmup
+    validation_done = False
     for _ in range(args.warmup):
         out = quantized_attention(
             query,
@@ -105,7 +89,7 @@ def benchmark_attention(args: argparse.Namespace) -> Dict[str, float]:
             attention_mask=attention_mask,
             use_cuda=args.use_cuda,
         )
-        if not args.disable_validation:
+        if not args.disable_validation and not validation_done:
             ref = quantized_attention(
                 query,
                 key_int8,
@@ -121,6 +105,7 @@ def benchmark_attention(args: argparse.Namespace) -> Dict[str, float]:
                 raise RuntimeError(f"Fused attention validation failed (max error {max_err:.4e})")
             elif max_err > 1e-3:
                 print(f"[INFO] CUDA kernel validation passed with error {max_err:.4e} (within tolerance)")
+            validation_done = True
 
     _sync(device)
     start = time.perf_counter()
@@ -227,8 +212,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    print(f"[DIAGNOSTIC] args.use_cuda: {args.use_cuda}")
-    print(f"[DIAGNOSTIC] args.device: {args.device}")
     results = {
         "attention": benchmark_attention(args),
     }

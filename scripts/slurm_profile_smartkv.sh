@@ -58,9 +58,14 @@ echo "Building CUDA extensions for this GPU..."
 echo "Checking CUDA availability..."
 python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_available()}')"
 
-# Ensure PyTorch matches CUDA version
-echo "Reinstalling PyTorch for CUDA 12.1..."
-pip install --force-reinstall torch==2.3.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Only reinstall PyTorch if version mismatch detected
+TORCH_VERSION=$(python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "missing")
+if [[ "${TORCH_VERSION}" != "2.3.1"* ]]; then
+    echo "PyTorch version mismatch (found: ${TORCH_VERSION}). Installing PyTorch 2.3.1 for CUDA 12.1..."
+    pip install torch==2.3.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+else
+    echo "PyTorch 2.3.1 already installed, skipping reinstall."
+fi
 
 # Install package
 echo "Installing SmartKV with CUDA extensions..."
@@ -96,18 +101,6 @@ echo "Added project root to PYTHONPATH: ${PWD}"
 
 echo "Verifying CUDA kernels..."
 python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"
-
-echo "Testing CUDA kernel import directly..."
-python -c "
-try:
-    import smartkv_cuda
-    print('Direct import of smartkv_cuda: SUCCESS')
-    print(f'Module location: {smartkv_cuda.__file__}')
-except ImportError as e:
-    print(f'Direct import of smartkv_cuda: FAILED - {e}')
-    import sys
-    print(f'Python path: {sys.path[:3]}')
-"
 echo "CUDA build complete."
 
 PROFILE_DEVICE=${PROFILE_DEVICE:-cuda}
@@ -150,9 +143,6 @@ if [[ "${ENABLE_FORECAST}" != "0" ]]; then
                    --forecast-blend "${FORECAST_BLEND}" \
                    --forecast-lr "${FORECAST_LR}")
 fi
-
-# Re-confirm LD_LIBRARY_PATH before profiling
-echo "Confirming LD_LIBRARY_PATH before profiling: ${LD_LIBRARY_PATH:0:200}..."
 
 for bs in ${BATCH_SIZES}; do
   echo "\n=== Profiling SmartKV (batch_size=${bs}) at $(date) ==="
