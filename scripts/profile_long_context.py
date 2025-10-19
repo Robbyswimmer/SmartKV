@@ -82,14 +82,13 @@ def profile_document(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
         if chunk_idx % 10 == 0:
             print(f"Processing chunk {chunk_idx}/{len(chunks)} ({total_tokens} tokens)...", flush=True)
 
-        if not token_ids:
-            continue
-
         attn = simulate_attention(args.num_heads, len(token_ids), focus_idx=len(token_ids) // 2)
         k_batch = torch.randn(len(token_ids), args.num_heads, args.head_dim, device=device)
         v_batch = torch.randn(len(token_ids), args.num_heads, args.head_dim, device=device)
 
         for name, cache in caches.items():
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
             start_time = perf_counter()
             if name == "smartkv":
                 cache.update_attention(0, attn, token_ids)
@@ -104,6 +103,8 @@ def profile_document(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
                 k_batch=k_batch.clone() if name != "smartkv" else k_batch,
                 v_batch=v_batch.clone() if name != "smartkv" else v_batch,
             )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
             timers[name] += perf_counter() - start_time
 
     print(f"Finished processing {len(chunks)} chunks, {total_tokens} total tokens", flush=True)
