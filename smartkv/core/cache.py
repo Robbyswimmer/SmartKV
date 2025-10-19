@@ -425,7 +425,8 @@ class SmartKVCache:
                 importance = self.importance_floor
             state = self._rank_state.get(token_id)
             if state is not None and token_id in rank_percent:
-                if state.get("streak", 0) < self.hysteresis_intervals:
+                enforce = compute_ratio(current_payload_bits) >= self.memory_budget * 0.85
+                if enforce and state.get("streak", 0) < self.hysteresis_intervals:
                     return
             util_gain = utility(next_bits) - utility(current_bits)
             if util_gain <= 0.0:
