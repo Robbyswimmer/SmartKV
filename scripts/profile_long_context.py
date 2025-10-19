@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Dict, List
+from time import perf_counter
 
 import torch
 
@@ -69,6 +70,8 @@ def profile_document(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
 
     total_tokens = 0
 
+    timers = {name: 0.0 for name in caches}
+
     for chunk_idx, chunk in enumerate(chunks):
         token_ids = list(range(total_tokens, total_tokens + len(chunk.split())))
         total_tokens += len(token_ids)
@@ -87,6 +90,7 @@ def profile_document(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
         v_batch = torch.randn(len(token_ids), args.num_heads, args.head_dim, device=device)
 
         for name, cache in caches.items():
+            start_time = perf_counter()
             if name == "smartkv":
                 cache.update_attention(0, attn, token_ids)
                 cache.allocate_precision(0, token_ids)
@@ -100,6 +104,7 @@ def profile_document(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
                 k_batch=k_batch.clone() if name != "smartkv" else k_batch,
                 v_batch=v_batch.clone() if name != "smartkv" else v_batch,
             )
+            timers[name] += perf_counter() - start_time
 
     print(f"Finished processing {len(chunks)} chunks, {total_tokens} total tokens", flush=True)
 
@@ -116,6 +121,7 @@ def profile_document(args: argparse.Namespace) -> Dict[str, Dict[str, float]]:
             "forecast_last_loss": cache.forecast_last_loss,
             "num_realloc": cache.realloc_counter,
             "num_tokens_cached": stats["num_tokens"],
+            "elapsed_s": timers.get(name, 0.0),
         }
     return results
 
@@ -160,6 +166,7 @@ def main() -> None:
         print(f"Storage mode: {metrics.get('storage_mode', 'unknown')}", flush=True)
         print(f"Precision distribution: {metrics.get('precision_distribution', {})}", flush=True)
         print(f"Reallocations: {metrics['num_realloc']}", flush=True)
+        print(f"Elapsed time: {metrics.get('elapsed_s', 0.0):.2f} s", flush=True)
         if metrics.get('forecast_last_loss') is not None:
             print(f"Forecast loss: {metrics['forecast_last_loss']:.4f}", flush=True)
         print("=" * 50, flush=True)
