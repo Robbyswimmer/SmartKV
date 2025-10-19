@@ -55,8 +55,13 @@ try:
 
         # Add ccbin if using conda compiler and ensure host compiler env vars are set
         conda_prefix = os.environ.get('CONDA_PREFIX')
+        print(f"[setup.py] CONDA_PREFIX: {conda_prefix}")
+
         if conda_prefix:
             conda_cxx = os.path.join(conda_prefix, 'bin', 'x86_64-conda-linux-gnu-g++')
+            print(f"[setup.py] Checking for conda g++ at: {conda_cxx}")
+            print(f"[setup.py] Exists: {os.path.exists(conda_cxx)}")
+
             if os.path.exists(conda_cxx):
                 nvcc_args = [f'--compiler-bindir={conda_cxx}'] + nvcc_args
                 os.environ['CXX'] = conda_cxx
@@ -66,6 +71,14 @@ try:
                     os.environ['CC'] = conda_cc
                 os.environ.setdefault('TORCH_NVCC_FLAGS', f'--compiler-bindir={conda_cxx}')
                 print(f"[setup.py] Using conda g++: {conda_cxx}")
+                print(f"[setup.py] nvcc_args: {nvcc_args[:3]}")  # Print first 3 args
+            else:
+                print(f"[setup.py] WARNING: Conda g++ not found! Using system compiler.")
+                # List what's actually in the bin directory
+                bin_dir = os.path.join(conda_prefix, 'bin')
+                if os.path.exists(bin_dir):
+                    gcc_files = [f for f in os.listdir(bin_dir) if 'g++' in f or 'gcc' in f]
+                    print(f"[setup.py] GCC files in {bin_dir}: {gcc_files[:10]}")
 
         ext_modules = [
             CUDAExtension(
