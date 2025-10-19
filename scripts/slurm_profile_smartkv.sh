@@ -90,6 +90,10 @@ TORCH_LIB_DIR=$(python -c "import torch; import os; print(os.path.join(os.path.d
 export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}"
 echo "Added PyTorch libs to LD_LIBRARY_PATH: ${TORCH_LIB_DIR}"
 
+# Add project root to PYTHONPATH so smartkv_cuda.so can be imported
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
+echo "Added project root to PYTHONPATH: ${PWD}"
+
 echo "Verifying CUDA kernels..."
 python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"
 
