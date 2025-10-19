@@ -54,7 +54,8 @@ class SmartKVCache:
         forecast_update_interval: int = 32,
         forecast_blend: float = 0.5,
         forecast_lr: float = 0.05,
-        utility_alpha: float = 0.6
+        utility_alpha: float = 0.6,
+        importance_floor: float = 1e-6
     ):
         """
         Initialize SmartKV cache.
@@ -71,6 +72,7 @@ class SmartKVCache:
             special_token_ids: Token IDs to always keep at 8-bit (BOS, EOS, etc.)
             use_bit_packing: Enable bit-packing for sub-byte storage (GPU only, requires CUDA)
             utility_alpha: Exponent for diminishing returns in precision utility (0 < alpha ≤ 1)
+            importance_floor: Minimum effective importance to keep spare budget useful
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -117,6 +119,7 @@ class SmartKVCache:
             self.forecast_predictor = None
 
         self.utility_alpha = float(utility_alpha) if utility_alpha > 0 else 1.0
+        self.importance_floor = float(max(importance_floor, 0.0))
 
         # Validate and adjust memory budget
         from smartkv.core.allocation import compute_minimum_budget
@@ -377,8 +380,12 @@ class SmartKVCache:
                 return
             next_bits = available_bits_asc[idx + 1]
             importance = importance_scores.get(token_id, 0.0)
-            if not math.isfinite(importance) or importance <= 0.0:
-                return
+            if not math.isfinite(importance):
+                importance = self.importance_floor if self.importance_floor > 0 else 0.0
+            if importance <= 0.0:
+                if self.importance_floor <= 0.0:
+                    return
+                importance = self.importance_floor
             util_gain = utility(next_bits) - utility(current_bits)
             if util_gain <= 0.0:
                 return
