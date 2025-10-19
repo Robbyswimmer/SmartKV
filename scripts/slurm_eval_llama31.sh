@@ -9,14 +9,9 @@
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu
 
-set -euo pipefail
+set -eo pipefail  # Removed -u to avoid conda activation issues
 
 export PYTHONUNBUFFERED=1
-export ADDR2LINE=${ADDR2LINE:-addr2line}
-export AR=${AR:-ar}
-export RANLIB=${RANLIB:-ranlib}
-export LD=${LD:-ld}
-export ADDR2LINE=${ADDR2LINE:-addr2line}
 
 # Navigate to project directory
 cd /data/SalmanAsif/RobbyMoseley/SmartKV/SmartKV
@@ -40,10 +35,8 @@ echo "Installing GCC 11 for CUDA compilation..."
 conda install -y -c conda-forge gxx_linux-64=11 -q
 
 # Reactivate environment to load compiler paths
-set +u  # Temporarily disable unbound variable check for conda
 conda deactivate
 conda activate "${CONDA_ENV}"
-set -u  # Re-enable unbound variable check
 
 # Set compiler environment variables
 export PATH="${CONDA_PREFIX}/bin:${PATH}"
