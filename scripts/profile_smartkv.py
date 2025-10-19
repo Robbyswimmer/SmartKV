@@ -10,11 +10,28 @@ import argparse
 import json
 import time
 from typing import Dict
+import os
+import sys
 
 import torch
 
+# Diagnostic: Check environment before importing smartkv
+print(f"[DIAGNOSTIC] LD_LIBRARY_PATH: {os.environ.get('LD_LIBRARY_PATH', 'NOT SET')[:200]}...")
+print(f"[DIAGNOSTIC] Python sys.path[0]: {sys.path[0]}")
+print(f"[DIAGNOSTIC] Current working directory: {os.getcwd()}")
+
+# Try direct import first to diagnose
+try:
+    import smartkv_cuda
+    print(f"[DIAGNOSTIC] Direct smartkv_cuda import: SUCCESS")
+    print(f"[DIAGNOSTIC] Module location: {smartkv_cuda.__file__}")
+except ImportError as e:
+    print(f"[DIAGNOSTIC] Direct smartkv_cuda import: FAILED - {e}")
+
 from smartkv.kernels import quantized_attention, CUDA_AVAILABLE
 from smartkv.core.cache import SmartKVCache
+
+print(f"[DIAGNOSTIC] CUDA_AVAILABLE after smartkv.kernels import: {CUDA_AVAILABLE}")
 
 
 def _sync(device: torch.device) -> None:
@@ -207,6 +224,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    print(f"[DIAGNOSTIC] args.use_cuda: {args.use_cuda}")
+    print(f"[DIAGNOSTIC] args.device: {args.device}")
     results = {
         "attention": benchmark_attention(args),
     }

@@ -119,9 +119,10 @@ echo "Memory Budget: ${BUDGET}"
 echo "Max Tokens: ${MAX_TOKENS}"
 echo "Output: ${OUTPUT_DIR}"
 echo ""
+echo "Confirming LD_LIBRARY_PATH: ${LD_LIBRARY_PATH:0:200}..."
 
 # Run comprehensive evaluation
-python -u smartkv/experiments/comprehensive_evaluation.py \
+LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}" python -u smartkv/experiments/comprehensive_evaluation.py \
     --model "${MODEL_PATH}" \
     --device "${DEVICE}" \
     --budget "${BUDGET}" \

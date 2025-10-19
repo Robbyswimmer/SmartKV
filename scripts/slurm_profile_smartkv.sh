@@ -147,9 +147,13 @@ if [[ "${ENABLE_FORECAST}" != "0" ]]; then
                    --forecast-lr "${FORECAST_LR}")
 fi
 
+# Re-confirm LD_LIBRARY_PATH before profiling
+echo "Confirming LD_LIBRARY_PATH before profiling: ${LD_LIBRARY_PATH:0:200}..."
+
 for bs in ${BATCH_SIZES}; do
   echo "\n=== Profiling SmartKV (batch_size=${bs}) at $(date) ==="
-  python -u scripts/profile_smartkv.py \
+  # Explicitly set LD_LIBRARY_PATH for this command to be absolutely sure
+  LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}" python -u scripts/profile_smartkv.py \
     --device "${PROFILE_DEVICE}" \
     --batch-size "${bs}" \
     --num-heads "${HEADS}" \
@@ -170,7 +174,7 @@ echo "SmartKV profiling sweep complete at $(date)"
 # Optional long-context profiling with Romeo and Juliet
 if [[ "${ENABLE_LONG_CONTEXT:-0}" != "0" ]]; then
   echo "\n=== Profiling long-context document (${PROFILE_DEVICE}) at $(date) ==="
-  python -u scripts/profile_long_context.py \
+  LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}" python -u scripts/profile_long_context.py \
     --document "${LONG_CONTEXT_DOC:-data/romeo_juliet.txt}" \
     --device "${PROFILE_DEVICE}" \
     --memory-budget "${CACHE_BUDGET}" \
