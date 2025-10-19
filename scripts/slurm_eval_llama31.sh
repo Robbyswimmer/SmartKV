@@ -12,6 +12,7 @@
 set -euo pipefail
 
 export PYTHONUNBUFFERED=1
+export ADDR2LINE=${ADDR2LINE:-addr2line}
 
 # Navigate to project directory
 cd /data/SalmanAsif/RobbyMoseley/SmartKV/SmartKV
@@ -32,7 +33,6 @@ mkdir -p logs experiments
 
 # Install modern GCC compiler for CUDA compilation
 echo "Installing GCC 11 for CUDA compilation..."
-export ADDR2LINE=${ADDR2LINE:-addr2line}
 conda install -y -c conda-forge gxx_linux-64=11 -q
 
 # Reactivate environment to load compiler paths
