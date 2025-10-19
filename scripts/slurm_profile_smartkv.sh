@@ -13,6 +13,9 @@ set -euo pipefail
 
 export PYTHONUNBUFFERED=1
 export ADDR2LINE=${ADDR2LINE:-addr2line}
+export AR=${AR:-ar}
+export RANLIB=${RANLIB:-ranlib}
+export LD=${LD:-ld}
 
 # Navigate to project directory
 PROJECT_DIR=/data/SalmanAsif/RobbyMoseley/SmartKV/SmartKV
@@ -43,10 +46,16 @@ conda activate "${CONDA_ENV}"
 set -u  # Re-enable unbound variable check
 
 # Set compiler environment variables
+export PATH="${CONDA_PREFIX}/bin:${PATH}"
+export ADDR2LINE=${ADDR2LINE:-addr2line}
+export AR=${AR:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ar}
+export RANLIB=${RANLIB:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ranlib}
+export LD=${LD:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ld}
 export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
 export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
 export CUDAHOSTCXX=${CXX}
-export NVCC_PREPEND_FLAGS="-ccbin ${CXX}"
+export NVCC_PREPEND_FLAGS="--compiler-bindir ${CXX}"
+export TORCH_NVCC_FLAGS="--compiler-bindir ${CXX}"
 export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9"
 echo "Using GCC: $(${CXX} --version | head -1)"
 

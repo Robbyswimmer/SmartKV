@@ -58,12 +58,13 @@ try:
         if conda_prefix:
             conda_cxx = os.path.join(conda_prefix, 'bin', 'x86_64-conda-linux-gnu-g++')
             if os.path.exists(conda_cxx):
-                nvcc_args = ['-ccbin', conda_cxx] + nvcc_args
+                nvcc_args = [f'--compiler-bindir={conda_cxx}'] + nvcc_args
                 os.environ['CXX'] = conda_cxx
                 os.environ['CUDAHOSTCXX'] = conda_cxx
                 conda_cc = os.path.join(conda_prefix, 'bin', 'x86_64-conda-linux-gnu-gcc')
                 if os.path.exists(conda_cc):
                     os.environ['CC'] = conda_cc
+                os.environ.setdefault('TORCH_NVCC_FLAGS', f'--compiler-bindir={conda_cxx}')
                 print(f"[setup.py] Using conda g++: {conda_cxx}")
 
         ext_modules = [
