@@ -64,7 +64,12 @@ echo "Building CUDA extensions for this GPU..."
 echo "Checking CUDA availability..."
 python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_available()}')"
 
+# Ensure PyTorch matches CUDA version
+echo "Reinstalling PyTorch for CUDA 12.1..."
+pip install --force-reinstall torch==2.3.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 # Install package
+echo "Installing SmartKV with CUDA extensions..."
 pip uninstall smartkv -y -q
 pip install -e . --no-build-isolation 2>&1 | tee logs/build_output.log
 
