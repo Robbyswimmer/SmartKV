@@ -23,29 +23,47 @@ elif command -v module &>/dev/null; then
 fi
 
 CONDA_ENV=${CONDA_ENV:-smartkv}
+GCC_VERSION=${GCC_VERSION:-11}
 echo "Activating conda environment '${CONDA_ENV}'"
 conda activate "$CONDA_ENV"
 
+echo "Installing GCC ${GCC_VERSION} for CUDA compilation..."
+conda install -y -c conda-forge gxx_linux-64=${GCC_VERSION} -q
+
+conda deactivate
+conda activate "$CONDA_ENV"
+
+export PATH="${CONDA_PREFIX}/bin:${PATH}"
+export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
+export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
+export CUDAHOSTCXX=${CXX}
+export NVCC_PREPEND_FLAGS="--compiler-bindir ${CXX}"
+export TORCH_NVCC_FLAGS="--compiler-bindir ${CXX}"
+export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9"
+echo "Using GCC: $(${CXX} --version | head -1)"
+
 mkdir -p logs
 
-if ! python - <<'PY'
+PYTHONUNBUFFERED=1 python - <<'PY'
 import importlib
 spec = importlib.util.find_spec('smartkv_cuda')
 if spec is None:
     raise SystemExit(1)
 PY
-then
+
+if [[ $? -ne 0 ]]; then
   echo "smartkv_cuda not found; building extension..."
   pip install -e . --no-build-isolation
-  python setup.py build_ext --inplace
+  CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace
 fi
 
-if ! python - <<'PY'
+PYTHONUNBUFFERED=1 python - <<'PY'
 import importlib
 import sys
 sys.exit(0 if importlib.util.find_spec('smartkv_cuda') else 1)
 PY
-then
+
+if [[ $? -ne 0 ]]; then
   echo "ERROR: smartkv_cuda extension is still unavailable after build." >&2
   exit 1
 fi
@@ -69,3 +87,4 @@ python scripts/benchmark_gpu_attention.py \
   --warmup "$WARMUP" \
   --seed "$SEED" \
   --enable-packing
+
