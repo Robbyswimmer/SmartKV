@@ -34,6 +34,10 @@ conda deactivate
 conda activate "$CONDA_ENV"
 
 export PATH="${CONDA_PREFIX}/bin:${PATH}"
+export ADDR2LINE=${ADDR2LINE:-addr2line}
+export AR=${AR:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ar}
+export RANLIB=${RANLIB:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ranlib}
+export LD=${LD:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ld}
 export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
 export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
 export CUDAHOSTCXX=${CXX}
@@ -44,29 +48,53 @@ echo "Using GCC: $(${CXX} --version | head -1)"
 
 mkdir -p logs
 
-PYTHONUNBUFFERED=1 python - <<'PY'
+TORCH_VERSION=$(python -c "import torch; print(torch.__version__)" 2>/dev/null || echo "missing")
+if [[ "${TORCH_VERSION}" == "missing" ]]; then
+  echo "PyTorch not found in environment. Install torch with CUDA support before running." >&2
+fi
+
+if ! python - <<'PY'
 import importlib
 spec = importlib.util.find_spec('smartkv_cuda')
 if spec is None:
     raise SystemExit(1)
 PY
-
-if [[ $? -ne 0 ]]; then
-  echo "smartkv_cuda not found; building extension..."
+then
+  echo "smartkv_cuda not found; (re)building extension..."
+  pip uninstall smartkv -y -q || true
   pip install -e . --no-build-isolation
   CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace
+
+  SO_FILE=$(find . -name "smartkv_cuda*.so" -type f 2>/dev/null | head -1)
+  if [[ -n "${SO_FILE}" ]]; then
+    echo "Found extension at ${SO_FILE}"
+    if [[ ! -f "./$(basename ${SO_FILE})" ]]; then
+      cp "${SO_FILE}" .
+      echo "Copied extension to project root"
+    fi
+  else
+    echo "WARNING: smartkv_cuda .so not found after build" >&2
+  fi
 fi
 
-PYTHONUNBUFFERED=1 python - <<'PY'
+if ! python - <<'PY'
 import importlib
 import sys
 sys.exit(0 if importlib.util.find_spec('smartkv_cuda') else 1)
 PY
-
-if [[ $? -ne 0 ]]; then
+then
   echo "ERROR: smartkv_cuda extension is still unavailable after build." >&2
   exit 1
 fi
+
+TORCH_LIB_DIR=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}"
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
+
+echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+
+echo "Verifying CUDA kernel availability..."
+python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"
 
 : "${CONTEXT_LENGTH:=4096}"
 : "${NUM_HEADS:=32}"
