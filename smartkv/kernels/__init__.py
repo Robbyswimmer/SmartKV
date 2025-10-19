@@ -151,9 +151,16 @@ def quantized_attention(
         device_index = device.index if device.index is not None else torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device_index)
         shared_mem_bytes = (d + k_len + 32) * 4  # floats in shared memory
-        if shared_mem_bytes > props.shared_memory_per_block:
+
+        # Check shared memory limit (attribute name varies by PyTorch version)
+        max_shared_mem = getattr(props, 'max_shared_memory_per_block',
+                                 getattr(props, 'max_shared_memory_per_block_optin',
+                                        getattr(props, 'total_shared_memory_per_block', 49152)))
+
+        if shared_mem_bytes > max_shared_mem:
             warnings.warn(
-                "SmartKV CUDA kernel requires more shared memory than this GPU block supports. "
+                f"SmartKV CUDA kernel requires {shared_mem_bytes} bytes shared memory "
+                f"but GPU only has {max_shared_mem} bytes per block. "
                 "Falling back to PyTorch attention.",
                 RuntimeWarning
             )
