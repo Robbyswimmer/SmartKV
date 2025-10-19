@@ -5,6 +5,7 @@ Main class that integrates quantizers, importance tracking, and precision
 allocation to provide mixed-precision KV-cache compression.
 """
 
+import heapq
 import math
 from collections import deque
 import torch
@@ -52,7 +53,8 @@ class SmartKVCache:
         forecast_history: int = 2048,
         forecast_update_interval: int = 32,
         forecast_blend: float = 0.5,
-        forecast_lr: float = 0.05
+        forecast_lr: float = 0.05,
+        utility_alpha: float = 0.6
     ):
         """
         Initialize SmartKV cache.
@@ -68,6 +70,7 @@ class SmartKVCache:
             device: Device to store cache on ("cpu" or "cuda")
             special_token_ids: Token IDs to always keep at 8-bit (BOS, EOS, etc.)
             use_bit_packing: Enable bit-packing for sub-byte storage (GPU only, requires CUDA)
+            utility_alpha: Exponent for diminishing returns in precision utility (0 < alpha ≤ 1)
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -112,6 +115,8 @@ class SmartKVCache:
             self.forecast_last_importance = {}
             self.forecast_last_loss = None
             self.forecast_predictor = None
+
+        self.utility_alpha = float(utility_alpha) if utility_alpha > 0 else 1.0
 
         # Validate and adjust memory budget
         from smartkv.core.allocation import compute_minimum_budget
@@ -325,9 +330,10 @@ class SmartKVCache:
         importance_scores: Dict[int, float],
         protected_set: set
     ) -> Dict[int, int]:
-        available_bits = sorted(self.available_bits, reverse=True)
-        min_bits = min(self.available_bits)
-        max_bits = max(self.available_bits)
+        available_bits_desc = sorted(self.available_bits, reverse=True)
+        available_bits_asc = list(reversed(available_bits_desc))
+        min_bits = available_bits_asc[0]
+        max_bits = available_bits_desc[0]
 
         allocation = {tid: min_bits for tid in tokens}
 
@@ -355,28 +361,65 @@ class SmartKVCache:
                 return 0.0
             return (payload_bits + scale_bits_actual) / fp16_bits
 
-        sorted_tokens = sorted(
-            (tid for tid in tokens if tid not in protected_set and tid >= self.critical_token_window),
-            key=lambda tid: importance_scores.get(tid, 0.0),
-            reverse=True
-        )
+        utility_alpha = min(max(self.utility_alpha, 0.1), 1.0)
 
-        for tid in sorted_tokens:
-            best_bits = allocation[tid]
-            for bits in available_bits:
-                if bits <= best_bits:
-                    continue
-                if self.use_packing:
-                    payload_candidate = current_payload_bits + (bits - best_bits) * elements_per_token
-                else:
-                    payload_candidate = current_payload_bits
+        def utility(bits: int) -> float:
+            if utility_alpha == 1.0:
+                return float(bits)
+            return float(math.pow(bits, utility_alpha))
 
-                ratio_candidate = compute_ratio(payload_candidate)
-                if ratio_candidate <= self.memory_budget + 1e-6:
-                    allocation[tid] = bits
-                    current_payload_bits = payload_candidate
-                    best_bits = bits
-            allocation[tid] = best_bits
+        bit_index = {bits: idx for idx, bits in enumerate(available_bits_asc)}
+        heap: List[Tuple[float, int, int, int]] = []
+
+        def enqueue(token_id: int, current_bits: int) -> None:
+            idx = bit_index.get(current_bits)
+            if idx is None or idx >= len(available_bits_asc) - 1:
+                return
+            next_bits = available_bits_asc[idx + 1]
+            importance = importance_scores.get(token_id, 0.0)
+            if not math.isfinite(importance) or importance <= 0.0:
+                return
+            util_gain = utility(next_bits) - utility(current_bits)
+            if util_gain <= 0.0:
+                return
+            delta_bits = next_bits - current_bits
+            if delta_bits <= 0:
+                return
+            score = (importance * util_gain) / delta_bits
+            # max-heap via negated score
+            heapq.heappush(heap, (-score, token_id, current_bits, next_bits))
+
+        for tid in allocation:
+            if allocation[tid] < max_bits:
+                enqueue(tid, allocation[tid])
+
+        tol = 1e-6
+        current_ratio = compute_ratio(current_payload_bits)
+
+        while heap:
+            _score_neg, tid, expected_bits, next_bits = heapq.heappop(heap)
+            current_bits = allocation.get(tid, min_bits)
+            if current_bits != expected_bits:
+                # Stale entry; skip
+                continue
+
+            delta_payload = 0.0
+            if self.use_packing:
+                delta_payload = float((next_bits - current_bits) * elements_per_token)
+
+            ratio_candidate = compute_ratio(current_payload_bits + delta_payload)
+            if ratio_candidate > self.memory_budget + tol:
+                # Cannot afford this upgrade; skip and try other candidates
+                continue
+
+            allocation[tid] = next_bits
+            current_payload_bits += delta_payload
+            current_ratio = ratio_candidate
+
+            enqueue(tid, next_bits)
+
+            if current_ratio >= self.memory_budget + tol:
+                break
 
         ratio, stats = self._allocation_stats(allocation)
         if hasattr(self, '_logger') and self._logger:
