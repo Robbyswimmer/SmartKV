@@ -85,6 +85,11 @@ else
     echo "WARNING: No .so file found after build!"
 fi
 
+# Add PyTorch lib directory to LD_LIBRARY_PATH for CUDA extension loading
+TORCH_LIB_DIR=$(python -c "import torch; import os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}"
+echo "Added PyTorch libs to LD_LIBRARY_PATH: ${TORCH_LIB_DIR}"
+
 echo "Verifying CUDA kernels..."
 python -c "from smartkv.kernels import CUDA_AVAILABLE; print(f'SmartKV CUDA kernels available: {CUDA_AVAILABLE}')"
 
