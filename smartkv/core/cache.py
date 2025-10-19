@@ -335,6 +335,26 @@ class SmartKVCache:
             if tid in protected_set or tid < self.critical_token_window:
                 allocation[tid] = max_bits
 
+        num_tokens = len(allocation)
+        if num_tokens == 0:
+            return allocation
+
+        scale_bits = 32 if self.scale_dtype == "fp32" else 16
+        elements_per_token = 2 * self.num_heads * self.head_dim
+
+        if self.use_packing:
+            current_payload_bits = float(sum(bits * elements_per_token for bits in allocation.values()))
+        else:
+            current_payload_bits = float(num_tokens * elements_per_token * 8)
+
+        scale_bits_actual = float(num_tokens * 2 * self.num_heads * scale_bits)
+        fp16_bits = float(num_tokens * elements_per_token * 16)
+
+        def compute_ratio(payload_bits: float) -> float:
+            if fp16_bits <= 0:
+                return 0.0
+            return (payload_bits + scale_bits_actual) / fp16_bits
+
         sorted_tokens = sorted(
             (tid for tid in tokens if tid not in protected_set and tid >= self.critical_token_window),
             key=lambda tid: importance_scores.get(tid, 0.0),
@@ -346,12 +366,16 @@ class SmartKVCache:
             for bits in available_bits:
                 if bits <= best_bits:
                     continue
-                allocation[tid] = bits
-                ratio, _ = self._allocation_stats(allocation)
-                if ratio <= self.memory_budget + 1e-6:
-                    best_bits = bits
+                if self.use_packing:
+                    payload_candidate = current_payload_bits + (bits - best_bits) * elements_per_token
                 else:
-                    allocation[tid] = best_bits
+                    payload_candidate = current_payload_bits
+
+                ratio_candidate = compute_ratio(payload_candidate)
+                if ratio_candidate <= self.memory_budget + 1e-6:
+                    allocation[tid] = bits
+                    current_payload_bits = payload_candidate
+                    best_bits = bits
             allocation[tid] = best_bits
 
         ratio, stats = self._allocation_stats(allocation)
