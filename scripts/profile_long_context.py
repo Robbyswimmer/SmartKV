@@ -51,6 +51,9 @@ def profile_document(args: argparse.Namespace) -> Dict[str, float]:
     doc_path = Path(args.document)
     chunks = read_document(doc_path, args.chunk_tokens)
 
+    print(f"Processing document: {doc_path}", flush=True)
+    print(f"Total chunks: {len(chunks)}", flush=True)
+
     tracker = ImportanceTracker(num_layers=1, decay=cache.decay, device='cpu')
     total_tokens = 0
 
@@ -59,6 +62,10 @@ def profile_document(args: argparse.Namespace) -> Dict[str, float]:
         total_tokens += len(token_ids)
         if not token_ids:
             continue
+
+        # Progress indicator every 10 chunks
+        if chunk_idx % 10 == 0:
+            print(f"Processing chunk {chunk_idx}/{len(chunks)} ({total_tokens} tokens)...", flush=True)
 
         attn = simulate_attention(args.num_heads, len(token_ids), focus_idx=len(token_ids) // 2)
         cache.update_attention(0, attn, token_ids)
@@ -69,6 +76,8 @@ def profile_document(args: argparse.Namespace) -> Dict[str, float]:
             k_batch=torch.randn(len(token_ids), args.num_heads, args.head_dim, device=device),
             v_batch=torch.randn(len(token_ids), args.num_heads, args.head_dim, device=device),
         )
+
+    print(f"Finished processing {len(chunks)} chunks, {total_tokens} total tokens", flush=True)
 
     stats = cache.get_memory_stats()
     results = {
@@ -109,23 +118,23 @@ def main() -> None:
     results = profile_document(args)
 
     # Pretty print results
-    print("\nLong-Context Document Profile Results")
-    print("=" * 50)
-    print(f"Document tokens: {results['document_tokens']}")
-    print(f"Tokens cached: {results['num_tokens_cached']}")
-    print(f"Memory budget: {args.memory_budget:.2f}")
-    print(f"Memory ratio (true): {results.get('memory_ratio_true', 0):.4f}")
-    print(f"Average bits: {results['avg_bits']:.2f}")
-    print(f"Storage mode: {results.get('storage_mode', 'unknown')}")
-    print(f"Precision distribution: {results.get('precision_distribution', {})}")
-    print(f"Reallocations: {results['num_realloc']}")
+    print("\nLong-Context Document Profile Results", flush=True)
+    print("=" * 50, flush=True)
+    print(f"Document tokens: {results['document_tokens']}", flush=True)
+    print(f"Tokens cached: {results['num_tokens_cached']}", flush=True)
+    print(f"Memory budget: {args.memory_budget:.2f}", flush=True)
+    print(f"Memory ratio (true): {results.get('memory_ratio_true', 0):.4f}", flush=True)
+    print(f"Average bits: {results['avg_bits']:.2f}", flush=True)
+    print(f"Storage mode: {results.get('storage_mode', 'unknown')}", flush=True)
+    print(f"Precision distribution: {results.get('precision_distribution', {})}", flush=True)
+    print(f"Reallocations: {results['num_realloc']}", flush=True)
     if results.get('forecast_last_loss') is not None:
-        print(f"Forecast loss: {results['forecast_last_loss']:.4f}")
-    print("=" * 50)
+        print(f"Forecast loss: {results['forecast_last_loss']:.4f}", flush=True)
+    print("=" * 50, flush=True)
 
     # Also output JSON for scripting
-    print("\nJSON Output:")
-    print(json.dumps(results, indent=2))
+    print("\nJSON Output:", flush=True)
+    print(json.dumps(results, indent=2), flush=True)
 
 
 if __name__ == "__main__":
