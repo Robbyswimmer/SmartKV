@@ -53,12 +53,16 @@ try:
             '-gencode=arch=compute_89,code=sm_89',  # RTX 40xx
         ]
 
-        # Add ccbin if using conda compiler
+        # Add ccbin if using conda compiler and ensure host compiler env vars are set
         conda_prefix = os.environ.get('CONDA_PREFIX')
         if conda_prefix:
             conda_cxx = os.path.join(conda_prefix, 'bin', 'x86_64-conda-linux-gnu-g++')
             if os.path.exists(conda_cxx):
-                nvcc_args = ['-ccbin', conda_cxx] + nvcc_args
+                nvcc_args = [f'-ccbin={conda_cxx}'] + nvcc_args
+                os.environ.setdefault('CXX', conda_cxx)
+                conda_cc = os.path.join(conda_prefix, 'bin', 'x86_64-conda-linux-gnu-gcc')
+                if os.path.exists(conda_cc):
+                    os.environ.setdefault('CC', conda_cc)
                 print(f"[setup.py] Using conda g++: {conda_cxx}")
 
         ext_modules = [

@@ -42,9 +42,11 @@ conda activate "${CONDA_ENV}"
 set -u  # Re-enable unbound variable check
 
 # Set compiler environment variables
+export ADDR2LINE=${ADDR2LINE:-addr2line}
 export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
 export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
 export CUDAHOSTCXX=${CXX}
+export NVCC_PREPEND_FLAGS="-ccbin ${CXX}"
 export TORCH_CUDA_ARCH_LIST="7.0;7.5;8.0;8.6;8.9"
 echo "Using GCC: $(${CXX} --version | head -1)"
 
