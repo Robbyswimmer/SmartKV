@@ -33,6 +33,7 @@ mkdir -p logs
 
 # Install modern GCC compiler for CUDA compilation
 echo "Installing GCC 11 for CUDA compilation..."
+export ADDR2LINE=${ADDR2LINE:-addr2line}
 conda install -y -c conda-forge gxx_linux-64=11 -q
 
 # Reactivate environment to load compiler paths
@@ -42,7 +43,6 @@ conda activate "${CONDA_ENV}"
 set -u  # Re-enable unbound variable check
 
 # Set compiler environment variables
-export ADDR2LINE=${ADDR2LINE:-addr2line}
 export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
 export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
 export CUDAHOSTCXX=${CXX}
