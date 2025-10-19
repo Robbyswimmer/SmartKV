@@ -176,6 +176,7 @@ if [[ "${ENABLE_LONG_CONTEXT:-0}" != "0" ]]; then
     --head-dim "${HEAD_DIM}" \
     --chunk-tokens "${LONG_CONTEXT_CHUNK:-256}" \
     --seed "${SEED}" \
+    $( [[ "${ENABLE_PACKING}" != "0" ]] && echo --enable-packing ) \
     $( [[ "${ENABLE_FORECAST}" != "0" ]] && echo --enable-forecast ) \
     --forecast-history "${FORECAST_HISTORY}" \
     --forecast-update-interval "${FORECAST_UPDATE_INTERVAL}" \

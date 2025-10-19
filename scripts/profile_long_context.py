@@ -40,6 +40,7 @@ def profile_document(args: argparse.Namespace) -> Dict[str, float]:
         head_dim=args.head_dim,
         memory_budget=args.memory_budget,
         device=device.type,
+        use_bit_packing=args.enable_packing,
         enable_forecast=args.enable_forecast,
         forecast_history=args.forecast_history,
         forecast_update_interval=args.forecast_update_interval,
@@ -75,6 +76,8 @@ def profile_document(args: argparse.Namespace) -> Dict[str, float]:
         "memory_ratio": stats["memory_ratio"],
         "memory_ratio_true": stats.get("memory_ratio_true"),
         "avg_bits": stats["avg_bits"],
+        "precision_distribution": stats.get("precision_distribution", {}),
+        "storage_mode": stats.get("storage_mode", "unknown"),
         "forecast_last_loss": cache.forecast_last_loss,
         "num_realloc": cache.realloc_counter,
         "num_tokens_cached": stats["num_tokens"],
@@ -91,6 +94,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--enable-packing", action="store_true", default=False,
+                        help="Enable bit-packing for sub-byte storage")
     parser.add_argument("--enable-forecast", action="store_true", default=False)
     parser.add_argument("--forecast-history", type=int, default=4096)
     parser.add_argument("--forecast-update-interval", type=int, default=32)
@@ -102,6 +107,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     results = profile_document(args)
+
+    # Pretty print results
+    print("\nLong-Context Document Profile Results")
+    print("=" * 50)
+    print(f"Document tokens: {results['document_tokens']}")
+    print(f"Tokens cached: {results['num_tokens_cached']}")
+    print(f"Memory budget: {args.memory_budget:.2f}")
+    print(f"Memory ratio (true): {results.get('memory_ratio_true', 0):.4f}")
+    print(f"Average bits: {results['avg_bits']:.2f}")
+    print(f"Storage mode: {results.get('storage_mode', 'unknown')}")
+    print(f"Precision distribution: {results.get('precision_distribution', {})}")
+    print(f"Reallocations: {results['num_realloc']}")
+    if results.get('forecast_last_loss') is not None:
+        print(f"Forecast loss: {results['forecast_last_loss']:.4f}")
+    print("=" * 50)
+
+    # Also output JSON for scripting
+    print("\nJSON Output:")
     print(json.dumps(results, indent=2))
 
 
