@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <cfloat>
+#include <cstdint>
 
 namespace {
 
@@ -439,7 +440,13 @@ __global__ void quantized_attention_bucket_tiled_kernel(
     int B, int H, int q_len, int k_len, int d,
     int packed_dim,  // actual dimension of packed data (d for int8, packed size for 2/3/4-bit)
     bool is_packed,  // true if data is bit-packed
-    int full_k_len   // full context length for mask stride (may differ from k_len in bucket)
+    int full_k_len,  // full context length for mask stride (may differ from k_len in bucket)
+    int64_t key_stride_tokens,
+    int64_t key_stride_heads,
+    int64_t key_stride_dim,
+    int64_t value_stride_tokens,
+    int64_t value_stride_heads,
+    int64_t value_stride_dim
 ) {
     // Grid: (B, H, q_len)
     int b = blockIdx.x;
@@ -480,6 +487,13 @@ __global__ void quantized_attention_bucket_tiled_kernel(
     // Number of tiles
     int num_tiles = (k_len + TILE_SIZE - 1) / TILE_SIZE;
 
+    (void)packed_dim;  // kept for API compatibility
+
+    const uint8_t* key_base_u8 = reinterpret_cast<const uint8_t*>(key_qx);
+    const int8_t* key_base_i8 = reinterpret_cast<const int8_t*>(key_qx);
+    const uint8_t* value_base_u8 = reinterpret_cast<const uint8_t*>(value_qx);
+    const int8_t* value_base_i8 = reinterpret_cast<const int8_t*>(value_qx);
+
     // Process each tile
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
         int tile_start = tile_idx * TILE_SIZE;
@@ -498,6 +512,8 @@ __global__ void quantized_attention_bucket_tiled_kernel(
             float k_scale_val = key_scale[k_scale_offset];
 
             // Compute dot product with on-the-fly unpacking
+            int64_t key_row_offset = static_cast<int64_t>(k_pos) * key_stride_tokens +
+                                     static_cast<int64_t>(h) * key_stride_heads;
             for (int d_idx = 0; d_idx < d; d_idx++) {
                 float q_val = shared_query[d_idx];
 
@@ -505,14 +521,12 @@ __global__ void quantized_attention_bucket_tiled_kernel(
                 int8_t k_q_val;
                 if (is_packed && BITS < 8) {
                     // Packed: unpack from packed buffer
-                    const void* k_packed_row = reinterpret_cast<const uint8_t*>(key_qx) +
-                                                k_pos * H * packed_dim + h * packed_dim;
+                    const uint8_t* k_packed_row = key_base_u8 + key_row_offset;
                     k_q_val = unpack_value<BITS>(k_packed_row, d_idx);
                 } else {
                     // INT8 storage
-                    const int8_t* k_int8 = reinterpret_cast<const int8_t*>(key_qx);
-                    int k_offset = (k_pos * H + h) * d + d_idx;
-                    k_q_val = k_int8[k_offset];
+                    int64_t k_offset = key_row_offset + static_cast<int64_t>(d_idx) * key_stride_dim;
+                    k_q_val = key_base_i8[k_offset];
                 }
 
                 float k_val = (float)k_q_val * k_scale_val;
@@ -594,14 +608,16 @@ __global__ void quantized_attention_bucket_tiled_kernel(
                 int8_t v_q_val;
                 if (is_packed && BITS < 8) {
                     // Packed: unpack from packed buffer
-                    const void* v_packed_row = reinterpret_cast<const uint8_t*>(value_qx) +
-                                                k_pos * H * packed_dim + h * packed_dim;
+                    int64_t value_row_offset = static_cast<int64_t>(k_pos) * value_stride_tokens +
+                                              static_cast<int64_t>(h) * value_stride_heads;
+                    const uint8_t* v_packed_row = value_base_u8 + value_row_offset;
                     v_q_val = unpack_value<BITS>(v_packed_row, d_idx);
                 } else {
                     // INT8 storage
-                    const int8_t* v_int8 = reinterpret_cast<const int8_t*>(value_qx);
-                    int v_offset = (k_pos * H + h) * d + d_idx;
-                    v_q_val = v_int8[v_offset];
+                    int64_t value_row_offset = static_cast<int64_t>(k_pos) * value_stride_tokens +
+                                              static_cast<int64_t>(h) * value_stride_heads +
+                                              static_cast<int64_t>(d_idx) * value_stride_dim;
+                    v_q_val = value_base_i8[value_row_offset];
                 }
 
                 float v_val = (float)v_q_val * v_scale_val;
@@ -670,26 +686,50 @@ void launch_bucket_kernel(
     float* m_ptr = m_out.data_ptr<float>();
     float* s_ptr = s_out.data_ptr<float>();
 
+    // Extract strides (in elements) for packed/int8 layouts
+    auto key_strides = key_qx.strides();
+    auto value_strides = value_qx.strides();
+
+    int64_t key_stride_tokens = key_strides.size() > 0 ? key_strides[0] : 0;
+    int64_t key_stride_heads = key_strides.size() > 1 ? key_strides[1] : 0;
+    int64_t key_stride_dim = key_strides.size() > 2 ? key_strides[2] : 1;
+
+    int64_t value_stride_tokens = value_strides.size() > 0 ? value_strides[0] : 0;
+    int64_t value_stride_heads = value_strides.size() > 1 ? value_strides[1] : 0;
+    int64_t value_stride_dim = value_strides.size() > 2 ? value_strides[2] : 1;
+
     // Dispatch to appropriate template based on bits
     if (bits == 2) {
         quantized_attention_bucket_tiled_kernel<2, TILE_SIZE><<<grid, block, shared_mem_size>>>(
             query_ptr, key_qx_ptr, key_scale_ptr, value_qx_ptr, value_scale_ptr,
-            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d, packed_dim, is_packed, full_k_len
+            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d,
+            packed_dim, is_packed, full_k_len,
+            key_stride_tokens, key_stride_heads, key_stride_dim,
+            value_stride_tokens, value_stride_heads, value_stride_dim
         );
     } else if (bits == 3) {
         quantized_attention_bucket_tiled_kernel<3, TILE_SIZE><<<grid, block, shared_mem_size>>>(
             query_ptr, key_qx_ptr, key_scale_ptr, value_qx_ptr, value_scale_ptr,
-            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d, packed_dim, is_packed, full_k_len
+            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d,
+            packed_dim, is_packed, full_k_len,
+            key_stride_tokens, key_stride_heads, key_stride_dim,
+            value_stride_tokens, value_stride_heads, value_stride_dim
         );
     } else if (bits == 4) {
         quantized_attention_bucket_tiled_kernel<4, TILE_SIZE><<<grid, block, shared_mem_size>>>(
             query_ptr, key_qx_ptr, key_scale_ptr, value_qx_ptr, value_scale_ptr,
-            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d, packed_dim, is_packed, full_k_len
+            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d,
+            packed_dim, is_packed, full_k_len,
+            key_stride_tokens, key_stride_heads, key_stride_dim,
+            value_stride_tokens, value_stride_heads, value_stride_dim
         );
     } else if (bits == 8) {
         quantized_attention_bucket_tiled_kernel<8, TILE_SIZE><<<grid, block, shared_mem_size>>>(
             query_ptr, key_qx_ptr, key_scale_ptr, value_qx_ptr, value_scale_ptr,
-            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d, packed_dim, is_packed, full_k_len
+            mask_ptr, slots_ptr, output_ptr, m_ptr, s_ptr, B, H, q_len, k_len, d,
+            packed_dim, is_packed, full_k_len,
+            key_stride_tokens, key_stride_heads, key_stride_dim,
+            value_stride_tokens, value_stride_heads, value_stride_dim
         );
     } else {
         AT_ERROR("Unsupported bit-width: ", bits);
