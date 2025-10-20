@@ -279,9 +279,9 @@ def quantized_attention_bucketed(
     # Try using new bucket-aware kernel if CUDA is available
     if use_cuda and CUDA_AVAILABLE and hasattr(smartkv_cuda, 'quantized_attention_bucket_forward'):
         # Use new fused bucket kernel with streaming softmax across buckets
-        m_global = None
-        l_global = None
-        output_acc = None
+        bucket_outputs = []
+        bucket_ms = []
+        bucket_sums = []
 
         nonempty_bits = [bits for bits in sorted(bucket_views.keys()) if bucket_views[bits]['token_ids'].numel() > 0]
         if not nonempty_bits:
@@ -363,30 +363,28 @@ def quantized_attention_bucketed(
                 attention_mask,
                 full_k_len
             )
+            bucket_outputs.append(bucket_out)
+            bucket_ms.append(m_bucket)
+            bucket_sums.append(l_bucket)
 
-            if m_global is None:
-                m_global = m_bucket
-                l_global = l_bucket
-                output_acc = bucket_out
-                continue
-
-            max_m = torch.maximum(m_global, m_bucket)
-            scale_prev = torch.exp(m_global - max_m)
-            scale_curr = torch.exp(m_bucket - max_m)
-
-            output_acc = output_acc * scale_prev.unsqueeze(-1) + bucket_out * scale_curr.unsqueeze(-1)
-            l_global = l_global * scale_prev + l_bucket * scale_curr
-            m_global = max_m
-
-        if total_tokens == 0 or m_global is None:
+        if total_tokens == 0 or not bucket_outputs:
             return torch.zeros_like(query)
 
-        # Final normalization
-        denom = l_global.unsqueeze(-1)
-        output = torch.zeros_like(output_acc)
-        mask = denom > 0.0
+        m_stack = torch.stack(bucket_ms, dim=0)
+        global_m = torch.nan_to_num(torch.amax(m_stack, dim=0), nan=0.0)
+
+        numerator = torch.zeros_like(bucket_outputs[0])
+        denominator = torch.zeros_like(bucket_sums[0])
+        for out_part, m_part, s_part in zip(bucket_outputs, bucket_ms, bucket_sums):
+            scale = torch.exp(m_part - global_m)
+            numerator = numerator + out_part * scale.unsqueeze(-1)
+            denominator = denominator + torch.nan_to_num(s_part, nan=0.0) * scale
+
+        denom_expanded = denominator.unsqueeze(-1)
+        output = torch.zeros_like(numerator)
+        mask = denom_expanded > 0.0
         if mask.any():
-            output[mask] = output_acc[mask] / denom[mask]
+            output[mask] = numerator[mask] / denom_expanded[mask]
         return output
     else:
         # Fallback to existing unpacking approach
