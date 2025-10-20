@@ -80,11 +80,13 @@ def unpack_tensor(packed: torch.Tensor, bits: int, shape: Tuple[int, ...]) -> to
         >>> restored = unpack_tensor(packed, bits=3, shape=(8, 16, 128))
         >>> assert torch.equal(x, restored)
     """
+    if bits == 8:
+        if packed.dtype not in (torch.uint8, torch.int8):
+            raise ValueError(f"Packed tensor must be uint8/int8 for 8-bit, got {packed.dtype}")
+        return packed.view(shape).to(torch.int8)
+
     if packed.dtype != torch.uint8:
         raise ValueError(f"Packed tensor must be uint8, got {packed.dtype}")
-
-    if bits == 8:
-        return packed.view(shape).to(torch.int8)
 
     if bits not in [2, 3, 4]:
         raise ValueError(f"bits must be 2, 3, 4, or 8, got {bits}")
