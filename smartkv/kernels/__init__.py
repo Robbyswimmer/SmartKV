@@ -390,10 +390,9 @@ def quantized_attention_bucketed(
             denominator = denominator + s_part * scale
 
         denom_expanded = denominator.unsqueeze(-1)
-        output = torch.zeros_like(numerator)
-        mask = denom_expanded > 0.0
-        if mask.any():
-            output[mask] = numerator[mask] / denom_expanded[mask]
+        safe_denom = torch.where(denom_expanded > 0.0, denom_expanded, torch.ones_like(denom_expanded))
+        output = numerator / safe_denom
+        output = torch.where(denom_expanded > 0.0, output, torch.zeros_like(output))
         return output
     else:
         # Fallback to existing unpacking approach
