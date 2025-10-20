@@ -690,13 +690,16 @@ void launch_bucket_kernel(
     auto key_strides = key_qx.strides();
     auto value_strides = value_qx.strides();
 
-    int64_t key_stride_tokens = key_strides.size() > 0 ? key_strides[0] : 0;
-    int64_t key_stride_heads = key_strides.size() > 1 ? key_strides[1] : 0;
-    int64_t key_stride_dim = key_strides.size() > 2 ? key_strides[2] : 1;
+    int64_t key_elem_size = key_qx.element_size();
+    int64_t value_elem_size = value_qx.element_size();
 
-    int64_t value_stride_tokens = value_strides.size() > 0 ? value_strides[0] : 0;
-    int64_t value_stride_heads = value_strides.size() > 1 ? value_strides[1] : 0;
-    int64_t value_stride_dim = value_strides.size() > 2 ? value_strides[2] : 1;
+    int64_t key_stride_tokens = key_strides.size() > 0 ? key_strides[0] * key_elem_size : 0;
+    int64_t key_stride_heads = key_strides.size() > 1 ? key_strides[1] * key_elem_size : 0;
+    int64_t key_stride_dim = key_strides.size() > 2 ? key_strides[2] * key_elem_size : key_elem_size;
+
+    int64_t value_stride_tokens = value_strides.size() > 0 ? value_strides[0] * value_elem_size : 0;
+    int64_t value_stride_heads = value_strides.size() > 1 ? value_strides[1] * value_elem_size : 0;
+    int64_t value_stride_dim = value_strides.size() > 2 ? value_strides[2] * value_elem_size : value_elem_size;
 
     // Dispatch to appropriate template based on bits
     if (bits == 2) {
