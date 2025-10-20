@@ -279,9 +279,9 @@ def quantized_attention_bucketed(
     # Try using new bucket-aware kernel if CUDA is available
     if use_cuda and CUDA_AVAILABLE and hasattr(smartkv_cuda, 'quantized_attention_bucket_forward'):
         # Use new fused bucket kernel with streaming softmax across buckets
-        m_global = torch.full((batch, num_heads, q_len), float('-inf'), device=query.device)
-        l_global = torch.zeros((batch, num_heads, q_len), device=query.device)
-        output_acc = torch.zeros_like(query)
+        m_global = None
+        l_global = None
+        output_acc = None
 
         nonempty_bits = [bits for bits in sorted(bucket_views.keys()) if bucket_views[bits]['token_ids'].numel() > 0]
         if not nonempty_bits:
@@ -364,30 +364,29 @@ def quantized_attention_bucketed(
                 full_k_len
             )
 
-            # FIX ISSUE 3: Streaming softmax accumulation across buckets
-            # Update global max and rescale previous accumulator
-            m_prev = m_global.clone()
-            m_global = torch.maximum(m_global, m_bucket)
+            if m_global is None:
+                m_global = m_bucket
+                l_global = l_bucket
+                output_acc = bucket_out
+                continue
 
-            diff_prev = torch.nan_to_num(m_prev - m_global, nan=float('-inf'))
-            diff_curr = torch.nan_to_num(m_bucket - m_global, nan=float('-inf'))
-
-            scale_prev = torch.exp(diff_prev)
-            scale_curr = torch.exp(diff_curr)
+            max_m = torch.maximum(m_global, m_bucket)
+            scale_prev = torch.exp(m_global - max_m)
+            scale_curr = torch.exp(m_bucket - max_m)
 
             output_acc = output_acc * scale_prev.unsqueeze(-1) + bucket_out * scale_curr.unsqueeze(-1)
-            l_global = l_global * scale_prev + torch.nan_to_num(l_bucket, nan=0.0) * scale_curr
+            l_global = l_global * scale_prev + l_bucket * scale_curr
+            m_global = max_m
 
-        if total_tokens == 0:
+        if total_tokens == 0 or m_global is None:
             return torch.zeros_like(query)
 
         # Final normalization
-        denom = torch.nan_to_num(l_global, nan=0.0)
-        denom_expanded = denom.unsqueeze(-1)
+        denom = l_global.unsqueeze(-1)
         output = torch.zeros_like(output_acc)
-        mask = denom_expanded > 0.0
+        mask = denom > 0.0
         if mask.any():
-            output[mask] = output_acc[mask] / denom_expanded[mask]
+            output[mask] = output_acc[mask] / denom[mask]
         return output
     else:
         # Fallback to existing unpacking approach
