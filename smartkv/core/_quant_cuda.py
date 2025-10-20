@@ -2,7 +2,9 @@
 CUDA quantization kernels for SmartKV.
 
 This module provides GPU-accelerated per-head quantization for KV-cache compression.
-Currently a placeholder that will be implemented with actual CUDA kernels in Phase 2.
+When the `smartkv_cuda` extension is available it launches a custom CUDA kernel that
+computes per-head scales and quantized payloads; otherwise it falls back to PyTorch
+ops (slower).
 """
 
 import torch
@@ -35,8 +37,7 @@ def quantize_per_head_cuda(
         - v_scale: [N, H] float32 on CUDA
 
     Note:
-        This is currently a placeholder implementation using PyTorch ops.
-        Will be replaced with custom CUDA kernel in Phase 2 for better performance.
+        Uses the CUDA extension when available; otherwise falls back to PyTorch ops.
     """
     if not k_subset.is_cuda or not v_subset.is_cuda:
         raise ValueError("Input tensors must be on CUDA device")
@@ -69,10 +70,22 @@ def quantize_per_head_cuda(
     return k_q, v_q, k_scale_out, v_scale_out
 
 
-# TODO: Implement actual CUDA kernel in Phase 2
-# The current implementation uses PyTorch ops which are slower than a custom kernel
-# Custom kernel will:
-# 1. Fuse per-head max computation with quantization
-# 2. Use warp-level primitives for reduction
-# 3. Optimize memory access patterns
-# 4. Support bit-packing for 2/3/4-bit (Phase 2.3)
+def pack_values(tensor: torch.Tensor, bits: int) -> torch.Tensor:
+    if smartkv_cuda is not None:
+        return smartkv_cuda.pack_values(tensor, bits)
+    if bits == 8:
+        return tensor
+    return tensor.to(torch.uint8)
+
+
+def unpack_values(packed: torch.Tensor, bits: int, shape) -> torch.Tensor:
+    if smartkv_cuda is not None:
+        return smartkv_cuda.unpack_values(packed, bits, list(shape))
+    return packed.view(shape).to(torch.int8)
+
+
+__all__ = [
+    "quantize_per_head_cuda",
+    "pack_values",
+    "unpack_values",
+]

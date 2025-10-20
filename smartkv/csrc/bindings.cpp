@@ -30,6 +30,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("bits")
     );
 
+    m.def(
+        "quantized_attention_bucket_forward",
+        &quantized_attention_bucket_forward,
+        "Bucket-aware fused quantized attention with on-the-fly unpacking (CUDA)",
+        py::arg("query"),
+        py::arg("key_qx"),
+        py::arg("key_scale"),
+        py::arg("value_qx"),
+        py::arg("value_scale"),
+        py::arg("global_slots"),
+        py::arg("bits"),
+        py::arg("packed_dim"),
+        py::arg("is_packed"),
+        py::arg("attention_mask") = py::none(),
+        py::arg("full_k_len") = -1
+    );
+
     // Bit-packing functions
     m.def(
         "pack_2bit",

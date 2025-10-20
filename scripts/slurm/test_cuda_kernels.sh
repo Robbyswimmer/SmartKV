@@ -32,7 +32,8 @@ mkdir -p logs
 
 # Configuration
 DEVICE=${DEVICE:-cuda:0}
-TEST_MODULES=${TEST_MODULES:-"test_cuda_kernels test_bit_packing"}
+TEST_MODULES=${TEST_MODULES:-"test_cuda_kernels test_bit_packing test_quant_cuda"}
+RUN_BENCHMARK=${RUN_BENCHMARK:-false}
 OUTPUT_ROOT=${OUTPUT_ROOT:-"$PWD/results/unit_tests/${SLURM_JOB_ID}"}
 
 mkdir -p "$OUTPUT_ROOT"
@@ -40,6 +41,7 @@ mkdir -p "$OUTPUT_ROOT"
 echo "Configuration:"
 echo "  Device: $DEVICE"
 echo "  Test modules: $TEST_MODULES"
+echo "  Run benchmark: $RUN_BENCHMARK"
 echo "  Output: $OUTPUT_ROOT"
 echo ""
 
@@ -52,6 +54,7 @@ echo "Running pytest unit tests..."
 # Run unit tests with pytest
 pytest tests/test_cuda_kernels.py \
   tests/test_bit_packing.py \
+  tests/test_quant_cuda.py \
   -v \
   -s \
   --tb=short \
@@ -66,6 +69,21 @@ if [ $TEST_EXIT_CODE -eq 0 ]; then
 else
   echo ""
   echo "❌ Some unit tests failed (exit code: $TEST_EXIT_CODE)"
+fi
+
+# Run benchmark if requested
+if [ "$RUN_BENCHMARK" = "true" ]; then
+  echo ""
+  echo "Running bucket kernel benchmark..."
+  pytest tests/test_bucket_kernel_benchmark.py::test_bucket_kernel_vs_uniform_int8 \
+    -v \
+    -s \
+    | tee "$OUTPUT_ROOT/benchmark_output.txt"
+
+  BENCH_EXIT_CODE=$?
+  if [ $BENCH_EXIT_CODE -ne 0 ]; then
+    echo "⚠️  Benchmark failed (exit code: $BENCH_EXIT_CODE)"
+  fi
 fi
 
 echo ""

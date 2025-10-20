@@ -22,11 +22,13 @@ from smartkv.core.forecast import ForecastPredictor
 
 # Bit-packing support (GPU only)
 try:
-    from smartkv.kernels.bit_packing import pack_tensor, unpack_tensor, CUDA_AVAILABLE as PACKING_AVAILABLE
+    from smartkv.kernels.bit_packing import pack_tensor, unpack_tensor, compute_packed_size, CUDA_AVAILABLE as PACKING_AVAILABLE
 except ImportError:
     PACKING_AVAILABLE = False
     pack_tensor = None
     unpack_tensor = None
+    def compute_packed_size(num_elements: int, bits: int) -> int:
+        return num_elements
 
 
 class SmartKVCache:
@@ -57,7 +59,8 @@ class SmartKVCache:
         utility_alpha: float = 0.5,
         importance_floor: float = 1e-6,
         hysteresis_rank_threshold: float = 0.05,
-        hysteresis_intervals: int = 2
+        hysteresis_intervals: int = 2,
+        use_bucketed_layout: bool = False
     ):
         """
         Initialize SmartKV cache.
@@ -77,6 +80,7 @@ class SmartKVCache:
             importance_floor: Minimum effective importance to keep spare budget useful
             hysteresis_rank_threshold: Minimum percentile rank change to consider reallocating a token
             hysteresis_intervals: Number of consecutive reallocations the threshold must be exceeded
+            use_bucketed_layout: Enable experimental bucketed cache layout for GPU kernels
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -127,6 +131,7 @@ class SmartKVCache:
         self.hysteresis_rank_threshold = float(max(hysteresis_rank_threshold, 0.0))
         self.hysteresis_intervals = max(int(hysteresis_intervals), 1)
         self._rank_state: Dict[int, Dict[str, float]] = {}
+        self.use_bucketed_layout = bool(use_bucketed_layout)
 
         # Validate and adjust memory budget
         from smartkv.core.allocation import compute_minimum_budget
@@ -191,7 +196,7 @@ class SmartKVCache:
         self.layer_store: List[Dict[str, Any]] = [
             self._init_layer_store() for _ in range(num_layers)
         ]
-        
+
         # Metadata
         self.token_counter = 0
         self.realloc_counter = 0
@@ -496,6 +501,104 @@ class SmartKVCache:
         )
         return stats.get('memory_ratio_true', 0.0), stats
 
+    def _remove_slot_from_buckets(self, layer_store: Dict[str, Any], slot: int) -> None:
+        if not self.use_bucketed_layout:
+            return
+        buckets = layer_store.get('buckets')
+        if not buckets:
+            return
+        for bucket in buckets.values():
+            bucket['indices'].discard(int(slot))
+            bucket['slot_map'].pop(int(slot), None)
+
+    def _register_bucket(self, layer_store: Dict[str, Any], slot: int, bits: int, bucket_index: Optional[int] = None) -> None:
+        if not self.use_bucketed_layout:
+            return
+        buckets = layer_store.get('buckets')
+        if not buckets or bits not in buckets:
+            return
+        self._remove_slot_from_buckets(layer_store, slot)
+        buckets[bits]['indices'].add(int(slot))
+        if bucket_index is None:
+            bucket_index = buckets[bits]['slot_map'].get(int(slot))
+        if bucket_index is None:
+            buffers = layer_store['bucket_buffers'][bits]
+            bucket_index = buffers['size'] - 1
+        buckets[bits]['slot_map'][int(slot)] = int(bucket_index)
+
+    def _move_bucket_entry(
+        self,
+        layer_store: Dict[str, Any],
+        slot: int,
+        old_bits: int,
+        new_bits: int,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor
+    ) -> None:
+        if not self.use_bucketed_layout:
+            return
+        buckets = layer_store.get('buckets')
+        if not buckets:
+            return
+        if old_bits in buckets:
+            self._pop_bucket_entry(layer_store, old_bits, slot)
+        token_id = int(layer_store['token_ids'][slot].item()) if layer_store['token_ids'] is not None else int(slot)
+        self._append_bucket_entry(layer_store, new_bits, token_id, slot, k_tensor, v_tensor, k_scale, v_scale)
+
+    def _get_bucket_indices(self, layer_store: Dict[str, Any], bits: int) -> torch.Tensor:
+        if not self.use_bucketed_layout:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        buckets = layer_store.get('buckets')
+        if not buckets or bits not in buckets:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        indices = buckets[bits]['indices']
+        if not indices:
+            return torch.empty(0, dtype=torch.long, device=self.device)
+        sorted_slots = sorted(indices)
+        return torch.tensor(sorted_slots, dtype=torch.long, device=self.device)
+
+    def get_bucket_views(self, layer_idx: int) -> Dict[int, Dict[str, torch.Tensor]]:
+        """Return per-bit bucket tensors for a layer (experimental)."""
+        if not self.use_bucketed_layout:
+            raise RuntimeError("Bucketed layout disabled")
+
+        if layer_idx < 0 or layer_idx >= self.num_layers:
+            raise IndexError("Invalid layer index")
+
+        layer_store = self.layer_store[layer_idx]
+        results: Dict[int, Dict[str, torch.Tensor]] = {}
+
+        for bits in self.available_bits:
+            buffers = layer_store['bucket_buffers'][bits]
+            size = buffers['size'] if buffers else 0
+            if size == 0:
+                continue
+            device = buffers['token_ids'].device
+
+            views: Dict[str, torch.Tensor] = {
+                'token_ids': buffers['token_ids'][:size].clone(),
+                'global_slots': buffers['global_slots'][:size].clone(),
+                'k_scale': buffers['k_scale'][:size].clone(),
+                'v_scale': buffers['v_scale'][:size].clone(),
+            }
+
+            if self.use_packing and bits < 8 and PACKING_AVAILABLE:
+                views['k_qx'] = buffers['k_qx'][:size].clone()
+                views['v_qx'] = buffers['v_qx'][:size].clone()
+                views['packed_dim'] = torch.tensor(buffers['packed_dim'], device=device)
+                views['packed'] = torch.tensor(1, device=device)
+            else:
+                views['k_qx'] = buffers['k_qx'][:size].clone()
+                views['v_qx'] = buffers['v_qx'][:size].clone()
+                views['packed_dim'] = torch.tensor(self.head_dim, device=device)
+                views['packed'] = torch.tensor(0, device=device)
+
+            results[bits] = views
+
+        return results
+
     def _build_forecast_feature(self, token_id: int, raw_importance: float) -> torch.Tensor:
         if not self.enable_forecast:
             raise RuntimeError("Forecasting disabled")
@@ -585,8 +688,9 @@ class SmartKVCache:
         k_float = keys[0].to(self.device)
         v_float = values[0].to(self.device)
 
+        prev_bits = int(meta.get('bits', layer_store['bits'][slot].item() if layer_store['bits'] is not None else bits))
         k_q, v_q, k_scale, v_scale = self._quantize_kv_pair(k_float, v_float, bits)
-        self._write_quantized_slot(layer_store, slot, bits, k_q, v_q, k_scale, v_scale)
+        self._write_quantized_slot(layer_store, slot, bits, k_q, v_q, k_scale, v_scale, prev_bits=prev_bits)
 
         meta['bits'] = bits
         meta['qx'] = layer_store['k_qx'][slot]
@@ -634,8 +738,11 @@ class SmartKVCache:
         k_q: torch.Tensor,
         v_q: torch.Tensor,
         k_scale: torch.Tensor,
-        v_scale: torch.Tensor
+        v_scale: torch.Tensor,
+        prev_bits: Optional[int] = None
     ) -> None:
+        if prev_bits is None:
+            prev_bits = bits
         # Ensure tensors are on correct device
         k_device = layer_store['k_qx'].device if layer_store['k_qx'] is not None else self.device
         v_device = layer_store['v_qx'].device if layer_store['v_qx'] is not None else self.device
@@ -668,6 +775,12 @@ class SmartKVCache:
             layer_store['k_qx'][slot] = k_q.to(k_device)
             layer_store['v_qx'][slot] = v_q.to(v_device)
 
+        if self.use_bucketed_layout:
+            if prev_bits == bits:
+                self._update_bucket_entry(layer_store, bits, slot, k_q, v_q, k_scale, v_scale)
+            else:
+                self._move_bucket_entry(layer_store, slot, prev_bits, bits, k_q, v_q, k_scale, v_scale)
+
     def _init_layer_store(self) -> Dict[str, Any]:
         """Create empty storage buffers for a layer."""
         store = {
@@ -679,6 +792,8 @@ class SmartKVCache:
             'k_scale': None,
             'v_scale': None,
             'bits': None,
+            'buckets': self._create_bucket_dict() if self.use_bucketed_layout else None,
+            'bucket_buffers': self._create_bucket_buffers() if self.use_bucketed_layout else None,
         }
 
         # Bit-packing fields (optional)
@@ -689,6 +804,31 @@ class SmartKVCache:
             store['v_shapes'] = {}  # Dict[int, tuple] - slot -> original shape
 
         return store
+
+    def _create_bucket_dict(self) -> Dict[int, Dict[str, Any]]:
+        return {
+            bits: {
+                'indices': set(),
+                'slot_map': {},  # global slot -> bucket index
+            }
+            for bits in self.available_bits
+        }
+
+    def _create_bucket_buffers(self) -> Dict[int, Dict[str, Any]]:
+        return {
+            bits: {
+                'k_qx': None,
+                'v_qx': None,
+                'k_scale': None,
+                'v_scale': None,
+                'token_ids': None,
+                'global_slots': None,
+                'capacity': 0,
+                'size': 0,
+                'packed_dim': self.head_dim if not (self.use_packing and bits < 8) else compute_packed_size(self.head_dim, bits),
+            }
+            for bits in self.available_bits
+        }
 
     def _ensure_layer_capacity(self, layer_store: Dict[str, Any], min_capacity: int) -> None:
         """Ensure buffers can hold at least `min_capacity` tokens."""
@@ -726,6 +866,155 @@ class SmartKVCache:
         layer_store['v_scale'] = _grow_tensor(layer_store['v_scale'], (new_capacity, self.num_heads), torch.float32)
         layer_store['bits'] = _grow_tensor(layer_store['bits'], (new_capacity,), torch.uint8)
         layer_store['capacity'] = new_capacity
+
+    def _ensure_bucket_capacity(self, layer_store: Dict[str, Any], bits: int, min_capacity: int) -> None:
+        if not self.use_bucketed_layout:
+            return
+        buffers = layer_store['bucket_buffers'][bits]
+        if buffers['capacity'] >= min_capacity:
+            return
+
+        new_capacity = max(32, buffers['capacity'] * 2 if buffers['capacity'] else 32)
+        while new_capacity < min_capacity:
+            new_capacity *= 2
+
+        device = self.device
+        packed_dim = buffers['packed_dim']
+        payload_dtype = torch.uint8 if self.use_packing and bits < 8 else torch.int8
+
+        def grow(tensor: Optional[torch.Tensor], shape: Tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            if tensor is None:
+                return torch.empty(shape, dtype=dtype, device=device)
+            new_tensor = torch.empty(shape, dtype=dtype, device=device)
+            prev = tensor.shape[0]
+            if prev > 0:
+                new_tensor[:prev] = tensor
+            return new_tensor
+
+        buffers['token_ids'] = grow(buffers['token_ids'], (new_capacity,), torch.long)
+        buffers['global_slots'] = grow(buffers['global_slots'], (new_capacity,), torch.long)
+        buffers['k_qx'] = grow(buffers['k_qx'], (new_capacity, self.num_heads, packed_dim), payload_dtype)
+        buffers['v_qx'] = grow(buffers['v_qx'], (new_capacity, self.num_heads, packed_dim), payload_dtype)
+        buffers['k_scale'] = grow(buffers['k_scale'], (new_capacity, self.num_heads), torch.float32)
+        buffers['v_scale'] = grow(buffers['v_scale'], (new_capacity, self.num_heads), torch.float32)
+        buffers['capacity'] = new_capacity
+
+    def _append_bucket_entry(
+        self,
+        layer_store: Dict[str, Any],
+        bits: int,
+        token_id: int,
+        slot: int,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor
+    ) -> None:
+        if not self.use_bucketed_layout:
+            return
+        buffers = layer_store['bucket_buffers'][bits]
+        self._ensure_bucket_capacity(layer_store, bits, buffers['size'] + 1)
+
+        idx = buffers['size']
+        device = buffers['token_ids'].device
+        buffers['token_ids'][idx] = int(token_id)
+        buffers['global_slots'][idx] = int(slot)
+
+        if self.use_packing and bits < 8 and pack_tensor is not None:
+            packed_dim = buffers['packed_dim']
+            k_packed = pack_tensor(k_tensor.contiguous(), bits).reshape(self.num_heads, packed_dim)
+            v_packed = pack_tensor(v_tensor.contiguous(), bits).reshape(self.num_heads, packed_dim)
+            buffers['k_qx'][idx] = k_packed.to(device)
+            buffers['v_qx'][idx] = v_packed.to(device)
+        else:
+            buffers['k_qx'][idx] = k_tensor.to(device)
+            buffers['v_qx'][idx] = v_tensor.to(device)
+
+        buffers['k_scale'][idx] = k_scale.to(device)
+        buffers['v_scale'][idx] = v_scale.to(device)
+        buffers['size'] += 1
+
+        buckets = layer_store['buckets'][bits]
+        buckets['indices'].add(int(slot))
+        buckets['slot_map'][int(slot)] = idx
+
+    def _update_bucket_entry(
+        self,
+        layer_store: Dict[str, Any],
+        bits: int,
+        slot: int,
+        k_tensor: torch.Tensor,
+        v_tensor: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor
+    ) -> None:
+        if not self.use_bucketed_layout:
+            return
+        buckets = layer_store['buckets'][bits]
+        buffers = layer_store['bucket_buffers'][bits]
+        bucket_idx = buckets['slot_map'].get(int(slot))
+        if bucket_idx is None:
+            token_id = int(layer_store['token_ids'][slot].item()) if layer_store['token_ids'] is not None else int(slot)
+            self._append_bucket_entry(layer_store, bits, token_id, slot, k_tensor, v_tensor, k_scale, v_scale)
+            return
+        device = buffers['token_ids'].device
+        if self.use_packing and bits < 8 and pack_tensor is not None:
+            packed_dim = buffers['packed_dim']
+            k_packed = pack_tensor(k_tensor.contiguous(), bits).reshape(self.num_heads, packed_dim)
+            v_packed = pack_tensor(v_tensor.contiguous(), bits).reshape(self.num_heads, packed_dim)
+            buffers['k_qx'][bucket_idx] = k_packed.to(device)
+            buffers['v_qx'][bucket_idx] = v_packed.to(device)
+        else:
+            buffers['k_qx'][bucket_idx] = k_tensor.to(device)
+            buffers['v_qx'][bucket_idx] = v_tensor.to(device)
+        buffers['k_scale'][bucket_idx] = k_scale.to(device)
+        buffers['v_scale'][bucket_idx] = v_scale.to(device)
+        if layer_store['token_ids'] is not None:
+            buffers['token_ids'][bucket_idx] = int(layer_store['token_ids'][slot].item())
+        buffers['global_slots'][bucket_idx] = int(slot)
+        self._register_bucket(layer_store, slot, bits, bucket_idx=bucket_idx)
+
+    def _pop_bucket_entry(
+        self,
+        layer_store: Dict[str, Any],
+        bits: int,
+        slot: int
+    ) -> Optional[Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        if not self.use_bucketed_layout:
+            return None
+        buckets = layer_store['buckets'][bits]
+        buffers = layer_store['bucket_buffers'][bits]
+        bucket_idx = buckets['slot_map'].get(int(slot))
+        if bucket_idx is None:
+            return None
+
+        size = buffers['size']
+        last_idx = size - 1
+
+        token_id = int(buffers['token_ids'][bucket_idx].item())
+        k_tensor = buffers['k_qx'][bucket_idx].clone()
+        v_tensor = buffers['v_qx'][bucket_idx].clone()
+        k_scale = buffers['k_scale'][bucket_idx].clone()
+        v_scale = buffers['v_scale'][bucket_idx].clone()
+
+        if bucket_idx != last_idx:
+            # move last element into removed slot
+            buffers['token_ids'][bucket_idx] = buffers['token_ids'][last_idx]
+            buffers['global_slots'][bucket_idx] = buffers['global_slots'][last_idx]
+            buffers['k_qx'][bucket_idx] = buffers['k_qx'][last_idx]
+            buffers['v_qx'][bucket_idx] = buffers['v_qx'][last_idx]
+            buffers['k_scale'][bucket_idx] = buffers['k_scale'][last_idx]
+            buffers['v_scale'][bucket_idx] = buffers['v_scale'][last_idx]
+
+            moved_slot = int(buffers['global_slots'][bucket_idx].item())
+            buckets['slot_map'][moved_slot] = bucket_idx
+        buffers['size'] = last_idx
+
+        # clean up last slot (optional)
+        buckets['slot_map'].pop(int(slot), None)
+        buckets['indices'].discard(int(slot))
+
+        return token_id, k_tensor, v_tensor, k_scale, v_scale
     
     def quantize_and_store(
         self,
@@ -905,6 +1194,18 @@ class SmartKVCache:
                 'layer': layer_idx,
             }
 
+            if self.use_bucketed_layout:
+                self._append_bucket_entry(
+                    layer_store,
+                    int(bits_tensor[offset]),
+                    token_int,
+                    slot,
+                    k_qx[offset],
+                    v_qx[offset],
+                    k_scale[offset],
+                    v_scale[offset],
+                )
+
         layer_store['size'] = new_size
         self.total_tokens_stored += seq_len
         self.token_counter += seq_len
@@ -1001,10 +1302,12 @@ class SmartKVCache:
         """Return raw quantized buffers and metadata for fused attention."""
         layer_store = self.layer_store[layer_idx]
         size = layer_store['size']
+        device = layer_store['k_qx'].device if layer_store['k_qx'] is not None else self.device
+
         if size == 0:
-            empty_ids = torch.empty(0, dtype=torch.long)
-            empty_k = torch.empty((0, self.num_heads, self.head_dim), dtype=torch.int8)
-            empty_scale = torch.empty((0, self.num_heads), dtype=torch.float32)
+            empty_ids = torch.empty(0, dtype=torch.long, device=device)
+            empty_k = torch.empty((0, self.num_heads, self.head_dim), dtype=torch.int8, device=device)
+            empty_scale = torch.empty((0, self.num_heads), dtype=torch.float32, device=device)
             return {
                 'token_ids': empty_ids,
                 'k_qx': empty_k,
@@ -1017,26 +1320,31 @@ class SmartKVCache:
         if token_ids is None:
             indices = torch.arange(size, dtype=torch.long)
         else:
-            query = torch.tensor(token_ids, dtype=torch.long)
+            query = torch.tensor(token_ids, dtype=torch.long, device=device)
             pos = torch.searchsorted(token_ids_tensor, query)
             valid = (pos < size) & (token_ids_tensor[pos] == query)
             if not bool(valid.any()):
                 return {
-                    'token_ids': torch.empty(0, dtype=torch.long),
-                    'k_qx': torch.empty((0, self.num_heads, self.head_dim), dtype=torch.int8),
-                    'k_scale': torch.empty((0, self.num_heads), dtype=torch.float32),
-                    'v_qx': torch.empty((0, self.num_heads, self.head_dim), dtype=torch.int8),
-                    'v_scale': torch.empty((0, self.num_heads), dtype=torch.float32),
+                    'token_ids': torch.empty(0, dtype=torch.long, device=device),
+                    'k_qx': torch.empty((0, self.num_heads, self.head_dim), dtype=torch.int8, device=device),
+                    'k_scale': torch.empty((0, self.num_heads), dtype=torch.float32, device=device),
+                    'v_qx': torch.empty((0, self.num_heads, self.head_dim), dtype=torch.int8, device=device),
+                    'v_scale': torch.empty((0, self.num_heads), dtype=torch.float32, device=device),
                 }
             indices = pos[valid]
 
-        return {
+        result = {
             'token_ids': token_ids_tensor[indices].clone(),
-            'k_qx': layer_store['k_qx'][indices].clone().to('cpu'),
-            'k_scale': layer_store['k_scale'][indices].clone().to('cpu'),
-            'v_qx': layer_store['v_qx'][indices].clone().to('cpu'),
-            'v_scale': layer_store['v_scale'][indices].clone().to('cpu'),
+            'k_qx': layer_store['k_qx'][indices].clone(),
+            'k_scale': layer_store['k_scale'][indices].clone(),
+            'v_qx': layer_store['v_qx'][indices].clone(),
+            'v_scale': layer_store['v_scale'][indices].clone(),
         }
+
+        if self.use_bucketed_layout:
+            result['buckets'] = self.get_bucket_views(layer_idx)
+
+        return result
 
     def _dequantize_indices(
         self,

@@ -6,8 +6,10 @@ Automatically selects best kernel based on hardware and context length.
 """
 
 import torch
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict
 import warnings
+
+from smartkv.kernels.bit_packing import unpack_tensor
 
 
 def _ensure_query_layout(query: torch.Tensor) -> torch.Tensor:
@@ -180,6 +182,215 @@ def quantized_attention(
     return _quantized_attention_pytorch(
         query, key_int8, key_scale, value_int8, value_scale, attn_mask
     )
+
+
+def _assemble_from_buckets(
+    bucket_views: Dict[int, Dict[str, torch.Tensor]],
+    num_heads: int,
+    head_dim: int,
+    device: torch.device
+) -> Dict[str, torch.Tensor]:
+    if not bucket_views:
+        return {
+            'token_ids': torch.empty(0, dtype=torch.long, device=device),
+            'k_qx': torch.empty((1, num_heads, 0, head_dim), dtype=torch.int8, device=device),
+            'v_qx': torch.empty((1, num_heads, 0, head_dim), dtype=torch.int8, device=device),
+            'k_scale': torch.empty((1, num_heads, 0), dtype=torch.float32, device=device),
+            'v_scale': torch.empty((1, num_heads, 0), dtype=torch.float32, device=device),
+        }
+
+    k_chunks = []
+    v_chunks = []
+    ks_chunks = []
+    vs_chunks = []
+    slot_chunks = []
+    token_chunks = []
+
+    for bits in sorted(bucket_views.keys()):
+        view = bucket_views[bits]
+        size = view['token_ids'].numel()
+        if size == 0:
+            continue
+
+        slots = view['global_slots'].to(device)
+        order = torch.argsort(slots)
+
+        token_ids = view['token_ids'].to(device)[order]
+        token_chunks.append(token_ids)
+        slot_chunks.append(slots[order])
+
+        k = view['k_qx'][order].to(device)
+        v = view['v_qx'][order].to(device)
+        packed_flag = int(view.get('packed', torch.tensor(0, device=device)).item())
+        packed_dim = int(view.get('packed_dim', torch.tensor(head_dim, device=device)).item())
+
+        if packed_flag:
+            shape = (k.shape[0], num_heads, head_dim)
+            k = unpack_tensor(k.reshape(-1), bits, shape)
+            v = unpack_tensor(v.reshape(-1), bits, shape)
+        else:
+            k = k.to(torch.int8)
+            v = v.to(torch.int8)
+
+        k_chunks.append(k)
+        v_chunks.append(v)
+        ks_chunks.append(view['k_scale'][order].to(device))
+        vs_chunks.append(view['v_scale'][order].to(device))
+
+    if not slot_chunks:
+        return {
+            'token_ids': torch.empty(0, dtype=torch.long, device=device),
+            'k_qx': torch.empty((1, num_heads, 0, head_dim), dtype=torch.int8, device=device),
+            'v_qx': torch.empty((1, num_heads, 0, head_dim), dtype=torch.int8, device=device),
+            'k_scale': torch.empty((1, num_heads, 0), dtype=torch.float32, device=device),
+            'v_scale': torch.empty((1, num_heads, 0), dtype=torch.float32, device=device),
+        }
+
+    all_slots = torch.cat(slot_chunks, dim=0)
+    order = torch.argsort(all_slots)
+
+    k_all = torch.cat(k_chunks, dim=0)[order]
+    v_all = torch.cat(v_chunks, dim=0)[order]
+    ks_all = torch.cat(ks_chunks, dim=0)[order]
+    vs_all = torch.cat(vs_chunks, dim=0)[order]
+    token_ids = torch.cat(token_chunks, dim=0)[order]
+
+    return {
+        'token_ids': token_ids,
+        'k_qx': k_all.permute(1, 0, 2).contiguous().unsqueeze(0),
+        'v_qx': v_all.permute(1, 0, 2).contiguous().unsqueeze(0),
+        'k_scale': ks_all.transpose(0, 1).contiguous().unsqueeze(0),
+        'v_scale': vs_all.transpose(0, 1).contiguous().unsqueeze(0),
+    }
+
+
+def quantized_attention_bucketed(
+    query: torch.Tensor,
+    bucket_views: Dict[int, Dict[str, torch.Tensor]],
+    attention_mask: Optional[torch.Tensor] = None,
+    use_cuda: bool = True
+) -> torch.Tensor:
+    """Run quantized attention using bucketed cache views."""
+    query = _ensure_query_layout(query)
+    batch, num_heads, q_len, head_dim = query.shape
+    if batch != 1:
+        raise ValueError("Bucketed attention currently supports batch=1")
+
+    # Try using new bucket-aware kernel if CUDA is available
+    if use_cuda and CUDA_AVAILABLE and hasattr(smartkv_cuda, 'quantized_attention_bucket_forward'):
+        # Use new fused bucket kernel with streaming softmax across buckets
+        m_global = torch.full((batch, num_heads, q_len), float('-inf'), device=query.device)
+        l_global = torch.zeros((batch, num_heads, q_len), device=query.device)
+        output_acc = torch.zeros_like(query)
+
+        nonempty_bits = [bits for bits in sorted(bucket_views.keys()) if bucket_views[bits]['token_ids'].numel() > 0]
+        if not nonempty_bits:
+            return torch.zeros_like(query)
+
+        max_slot = max(int(bucket_views[bits]['global_slots'].max().item()) for bits in nonempty_bits)
+        full_k_len = max_slot + 1
+
+        total_tokens = 0
+
+        for bits in nonempty_bits:
+            view = bucket_views[bits]
+            size = view['token_ids'].numel()
+            if size == 0:
+                continue
+
+            total_tokens += size
+
+            # Extract bucket tensors
+            k_qx = view['k_qx'].to(query.device).contiguous()
+            v_qx = view['v_qx'].to(query.device).contiguous()
+            k_scale = view['k_scale'].to(query.device).contiguous()
+            v_scale = view['v_scale'].to(query.device).contiguous()
+            global_slots = view['global_slots'].to(query.device).contiguous()
+
+            # Determine if packed
+            packed_flag = int(view.get('packed', torch.tensor(0, device=query.device)).item())
+            packed_dim = int(view.get('packed_dim', torch.tensor(head_dim, device=query.device)).item())
+            is_packed = bool(packed_flag)
+
+            # Reshape to expected format: [num_tokens, H, packed_dim]
+            if k_qx.dim() == 3:
+                # Already correct shape
+                pass
+            else:
+                # Needs reshaping
+                k_qx = k_qx.view(size, num_heads, -1)
+                v_qx = v_qx.view(size, num_heads, -1)
+
+            # FIX ISSUE 1: Transpose scales from [H, num_tokens] to [num_tokens, H]
+            if k_scale.dim() == 2:
+                if k_scale.shape[0] == num_heads and k_scale.shape[1] == size:
+                    # Need transpose: [H, num_tokens] -> [num_tokens, H]
+                    k_scale = k_scale.transpose(0, 1).contiguous()
+                    v_scale = v_scale.transpose(0, 1).contiguous()
+                elif k_scale.shape[0] == size and k_scale.shape[1] == num_heads:
+                    # Already correct
+                    pass
+            elif k_scale.dim() == 3:
+                k_scale = k_scale.squeeze(0)
+                v_scale = v_scale.squeeze(0)
+                # Check and transpose if needed after squeeze
+                if k_scale.shape[0] == num_heads and k_scale.shape[1] == size:
+                    k_scale = k_scale.transpose(0, 1).contiguous()
+                    v_scale = v_scale.transpose(0, 1).contiguous()
+
+            # Call bucket kernel - returns (unnormalized_output, m, s)
+            bucket_out, m_bucket, l_bucket = smartkv_cuda.quantized_attention_bucket_forward(
+                query,
+                k_qx,
+                k_scale,
+                v_qx,
+                v_scale,
+                global_slots,
+                bits,
+                packed_dim,
+                is_packed,
+                attention_mask,
+                full_k_len
+            )
+
+            # FIX ISSUE 3: Streaming softmax accumulation across buckets
+            # Update global max and rescale previous accumulator
+            m_prev = m_global.clone()
+            m_global = torch.maximum(m_global, m_bucket)
+
+            # Rescale factor for previous accumulator
+            rescale_prev = torch.exp(m_prev - m_global).unsqueeze(-1)  # [B, H, q_len, 1]
+            output_acc = output_acc * rescale_prev
+
+            # Rescale factor for current bucket
+            rescale_curr = torch.exp(m_bucket - m_global).unsqueeze(-1)  # [B, H, q_len, 1]
+            output_acc = output_acc + bucket_out * rescale_curr
+
+            # Update global sum with rescaling
+            l_global = l_global * torch.exp(m_prev - m_global) + l_bucket * torch.exp(m_bucket - m_global)
+
+        if total_tokens == 0:
+            return torch.zeros_like(query)
+
+        # Final normalization
+        denom = l_global.unsqueeze(-1)
+        output = torch.where(denom > 0.0, output_acc / denom, torch.zeros_like(output_acc))
+        return output
+    else:
+        # Fallback to existing unpacking approach
+        assembled = _assemble_from_buckets(bucket_views, num_heads, head_dim, query.device)
+        if assembled['k_qx'].shape[2] == 0:
+            return torch.zeros_like(query)
+
+        return quantized_attention(
+            query,
+            assembled['k_qx'],
+            assembled['k_scale'],
+            assembled['v_qx'],
+            assembled['v_scale'],
+            attention_mask=attention_mask,
+            use_cuda=use_cuda,
+        )
 
 
 def _quantized_attention_pytorch(
