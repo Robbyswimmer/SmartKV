@@ -382,8 +382,12 @@ def quantized_attention_bucketed(
             return torch.zeros_like(query)
 
         # Final normalization
-        denom = torch.nan_to_num(l_global, nan=0.0).unsqueeze(-1)
-        output = torch.where(denom > 0.0, output_acc / denom, torch.zeros_like(output_acc))
+        denom = torch.nan_to_num(l_global, nan=0.0)
+        denom_expanded = denom.unsqueeze(-1)
+        output = torch.zeros_like(output_acc)
+        mask = denom_expanded > 0.0
+        if mask.any():
+            output[mask] = output_acc[mask] / denom_expanded[mask]
         return output
     else:
         # Fallback to existing unpacking approach
