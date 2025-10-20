@@ -287,8 +287,11 @@ def quantized_attention_bucketed(
         if not nonempty_bits:
             return torch.zeros_like(query)
 
-        max_slot = max(int(bucket_views[bits]['global_slots'].max().item()) for bits in nonempty_bits)
-        full_k_len = max_slot + 1
+        if attention_mask is not None:
+            full_k_len = attention_mask.shape[-1]
+        else:
+            max_slot = max(int(bucket_views[bits]['global_slots'].max().item()) for bits in nonempty_bits)
+            full_k_len = max_slot + 1
 
         total_tokens = 0
 
@@ -306,6 +309,14 @@ def quantized_attention_bucketed(
             k_scale = view['k_scale'].to(query.device).contiguous()
             v_scale = view['v_scale'].to(query.device).contiguous()
             global_slots = view['global_slots'].to(query.device).contiguous()
+
+            if global_slots.numel() > 1:
+                order = torch.argsort(global_slots)
+                global_slots = global_slots.index_select(0, order).contiguous()
+                k_qx = k_qx.index_select(0, order).contiguous()
+                v_qx = v_qx.index_select(0, order).contiguous()
+                k_scale = k_scale.index_select(0, order).contiguous()
+                v_scale = v_scale.index_select(0, order).contiguous()
 
             # Determine if packed
             packed_flag = int(view.get('packed', torch.tensor(0, device=query.device)).item())
@@ -358,22 +369,20 @@ def quantized_attention_bucketed(
             m_prev = m_global.clone()
             m_global = torch.maximum(m_global, m_bucket)
 
-            # Rescale factor for previous accumulator
-            rescale_prev = torch.exp(m_prev - m_global).unsqueeze(-1)  # [B, H, q_len, 1]
-            output_acc = output_acc * rescale_prev
+            diff_prev = torch.nan_to_num(m_prev - m_global, nan=float('-inf'))
+            diff_curr = torch.nan_to_num(m_bucket - m_global, nan=float('-inf'))
 
-            # Rescale factor for current bucket
-            rescale_curr = torch.exp(m_bucket - m_global).unsqueeze(-1)  # [B, H, q_len, 1]
-            output_acc = output_acc + bucket_out * rescale_curr
+            scale_prev = torch.exp(diff_prev)
+            scale_curr = torch.exp(diff_curr)
 
-            # Update global sum with rescaling
-            l_global = l_global * torch.exp(m_prev - m_global) + l_bucket * torch.exp(m_bucket - m_global)
+            output_acc = output_acc * scale_prev.unsqueeze(-1) + bucket_out * scale_curr.unsqueeze(-1)
+            l_global = l_global * scale_prev + torch.nan_to_num(l_bucket, nan=0.0) * scale_curr
 
         if total_tokens == 0:
             return torch.zeros_like(query)
 
         # Final normalization
-        denom = l_global.unsqueeze(-1)
+        denom = torch.nan_to_num(l_global, nan=0.0).unsqueeze(-1)
         output = torch.where(denom > 0.0, output_acc / denom, torch.zeros_like(output_acc))
         return output
     else:

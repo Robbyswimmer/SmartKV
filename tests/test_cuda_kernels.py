@@ -152,10 +152,16 @@ class TestFusedAttention:
         v_scale = v_scale.squeeze(0)
 
         # Prepare batched inputs for kernel
-        k_q_batched = k_q.unsqueeze(0).expand(batch_size, -1, -1, -1).cuda()
-        v_q_batched = v_q.unsqueeze(0).expand(batch_size, -1, -1, -1).cuda()
-        k_scale_batched = k_scale.unsqueeze(0).expand(batch_size, -1, -1).cuda()
-        v_scale_batched = v_scale.unsqueeze(0).expand(batch_size, -1, -1).cuda()
+        # Rearrange to [B, H, K, D] / [B, H, K]
+        k_q_head_first = k_q.permute(1, 0, 2)
+        v_q_head_first = v_q.permute(1, 0, 2)
+        k_scale_head_first = k_scale.permute(1, 0)
+        v_scale_head_first = v_scale.permute(1, 0)
+
+        k_q_batched = k_q_head_first.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous().cuda()
+        v_q_batched = v_q_head_first.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous().cuda()
+        k_scale_batched = k_scale_head_first.unsqueeze(0).expand(batch_size, -1, -1).contiguous().cuda()
+        v_scale_batched = v_scale_head_first.unsqueeze(0).expand(batch_size, -1, -1).contiguous().cuda()
 
         # CUDA fused attention
         output_cuda = quantized_attention(
@@ -167,18 +173,18 @@ class TestFusedAttention:
             attention_mask=None,
             use_cuda=True
         )
+        output_cuda = output_cuda.squeeze(2)
 
         # PyTorch reference: dequantize then attend
-        key_dequant = k_q.float() * k_scale.unsqueeze(-1)
-        value_dequant = v_q.float() * v_scale.unsqueeze(-1)
+        key_dequant = k_q_head_first.float() * k_scale_head_first.unsqueeze(-1)
+        value_dequant = v_q_head_first.float() * v_scale_head_first.unsqueeze(-1)
 
-        # Expand to batch and compute attention
-        key_batched = key_dequant.unsqueeze(0).expand(batch_size, -1, -1, -1).cuda()
-        value_batched = value_dequant.unsqueeze(0).expand(batch_size, -1, -1, -1).cuda()
+        key_batched = key_dequant.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous().cuda()
+        value_batched = value_dequant.unsqueeze(0).expand(batch_size, -1, -1, -1).contiguous().cuda()
 
         # Manual attention: Q @ K^T / sqrt(d), softmax, @ V
         query_expanded = query.unsqueeze(2)  # [B, H, 1, D]
-        key_transposed = key_batched.transpose(-2, -1)  # [B, KV_LEN, H, D] -> [B, H, D, KV_LEN]
+        key_transposed = key_batched.transpose(-2, -1)  # [B, H, D, K]
 
         scores = torch.matmul(query_expanded, key_transposed) / np.sqrt(head_dim)
         scores = scores.squeeze(2)  # [B, H, KV_LEN]
@@ -255,30 +261,35 @@ class TestCUDAPerformance:
             key.unsqueeze(0), value.unsqueeze(0), bits=8
         )
 
+        k_q_head_first = k_q.squeeze(0).permute(1, 0, 2)
+        v_q_head_first = v_q.squeeze(0).permute(1, 0, 2)
+        k_scale_head_first = k_scale.squeeze(0).permute(1, 0)
+        v_scale_head_first = v_scale.squeeze(0).permute(1, 0)
+
         # CPU timing
         start = time.time()
         for _ in range(10):
-            key_dequant = k_q.squeeze(0).float() * k_scale.squeeze(0).unsqueeze(-1)
-            value_dequant = v_q.squeeze(0).float() * v_scale.squeeze(0).unsqueeze(-1)
+            key_dequant = k_q_head_first.float() * k_scale_head_first.unsqueeze(-1)
+            value_dequant = v_q_head_first.float() * v_scale_head_first.unsqueeze(-1)
             _ = torch.nn.functional.scaled_dot_product_attention(
                 query.unsqueeze(2),
-                key_dequant.unsqueeze(0).transpose(1, 2).unsqueeze(2),
-                value_dequant.unsqueeze(0).transpose(1, 2).unsqueeze(2)
+                key_dequant.unsqueeze(0),
+                value_dequant.unsqueeze(0)
             )
         cpu_time = time.time() - start
 
         # GPU timing
-        query_cuda = query.cuda()
-        k_q_cuda = k_q.cuda()
-        v_q_cuda = v_q.cuda()
-        k_scale_cuda = k_scale.cuda()
-        v_scale_cuda = v_scale.cuda()
+        query_cuda = query.cuda().unsqueeze(2).contiguous()
+        k_q_cuda = k_q_head_first.unsqueeze(0).contiguous().cuda()
+        v_q_cuda = v_q_head_first.unsqueeze(0).contiguous().cuda()
+        k_scale_cuda = k_scale_head_first.unsqueeze(0).contiguous().cuda()
+        v_scale_cuda = v_scale_head_first.unsqueeze(0).contiguous().cuda()
 
         torch.cuda.synchronize()
         start = time.time()
         for _ in range(10):
             _ = quantized_attention(
-                query_cuda.squeeze(0),
+                query_cuda,
                 k_q_cuda,
                 k_scale_cuda,
                 v_q_cuda,
