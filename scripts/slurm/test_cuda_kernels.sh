@@ -21,7 +21,7 @@ elif command -v module &>/dev/null; then
   source "$HOME/.bashrc"
 fi
 
-CONDA_ENV=${CONDA_ENV:-smartkv-gpu}
+CONDA_ENV=${CONDA_ENV:-smartkv}
 echo "Activating conda environment '${CONDA_ENV}'"
 conda activate "${CONDA_ENV}"
 
