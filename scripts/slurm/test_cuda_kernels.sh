@@ -51,11 +51,34 @@ echo "Starting SmartKV CUDA kernel unit tests at $(date)"
 # Create logs directory
 mkdir -p logs
 
+# Always run from repository root (Slurm sets SLURM_SUBMIT_DIR)
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  cd "${SLURM_SUBMIT_DIR}"
+fi
+
+# Load explicit CUDA module if requested
+if [[ -n "${CUDA_MODULE:-}" ]]; then
+  echo "Loading CUDA module '${CUDA_MODULE}'"
+  module load "${CUDA_MODULE}" || true
+fi
+
+# Discover nvcc and CUDA_HOME so setup.py builds the extension
+if command -v nvcc >/dev/null 2>&1; then
+  NVCC_PATH=$(command -v nvcc)
+  export CUDA_HOME="${CUDA_HOME:-$(dirname "${NVCC_PATH}")/..}"
+  echo "Detected nvcc at ${NVCC_PATH}"
+  echo "Setting CUDA_HOME=${CUDA_HOME}"
+else
+  echo "❌ nvcc not found on PATH. Please load a CUDA module (set CUDA_MODULE) or export CUDA_HOME before submitting."
+  exit 1
+fi
+
 echo "Rebuilding SmartKV CUDA extension (force fresh .so for this job)..."
 rm -rf build smartkv_cuda.*.so
-python -m pip install -e . --no-deps --force-reinstall >/tmp/smartkv_cuda_build_${SLURM_JOB_ID}.log 2>&1 || {
-  echo "❌ CUDA extension rebuild failed. See /tmp/smartkv_cuda_build_${SLURM_JOB_ID}.log"
-  cat /tmp/smartkv_cuda_build_${SLURM_JOB_ID}.log
+LOG_SUFFIX=${SLURM_JOB_ID:-$$}
+python -m pip install -e . --no-deps --force-reinstall >/tmp/smartkv_cuda_build_${LOG_SUFFIX}.log 2>&1 || {
+  echo "❌ CUDA extension rebuild failed. See /tmp/smartkv_cuda_build_${LOG_SUFFIX}.log"
+  cat /tmp/smartkv_cuda_build_${LOG_SUFFIX}.log
   exit 1
 }
 python - <<'PY'
