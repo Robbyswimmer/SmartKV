@@ -51,6 +51,18 @@ echo "Starting SmartKV CUDA kernel unit tests at $(date)"
 # Create logs directory
 mkdir -p logs
 
+echo "Rebuilding SmartKV CUDA extension (force fresh .so for this job)..."
+rm -rf build smartkv_cuda.*.so
+python -m pip install -e . --no-deps --force-reinstall >/tmp/smartkv_cuda_build_${SLURM_JOB_ID}.log 2>&1 || {
+  echo "❌ CUDA extension rebuild failed. See /tmp/smartkv_cuda_build_${SLURM_JOB_ID}.log"
+  cat /tmp/smartkv_cuda_build_${SLURM_JOB_ID}.log
+  exit 1
+}
+python - <<'PY'
+import smartkv_cuda
+print("Loaded smartkv_cuda from:", smartkv_cuda.__file__)
+PY
+
 # Configuration
 DEVICE=${DEVICE:-cuda:0}
 TEST_MODULES=${TEST_MODULES:-"test_cuda_kernels test_bit_packing test_quant_cuda"}
