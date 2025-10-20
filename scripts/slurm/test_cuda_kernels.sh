@@ -56,10 +56,17 @@ if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
   cd "${SLURM_SUBMIT_DIR}"
 fi
 
-# Load explicit CUDA module if requested
-if [[ -n "${CUDA_MODULE:-}" ]]; then
-  echo "Loading CUDA module '${CUDA_MODULE}'"
-  module load "${CUDA_MODULE}" || true
+# Load explicit CUDA module if requested; otherwise fall back to a generic cuda module if available
+if command -v module >/dev/null 2>&1; then
+  if [[ -n "${CUDA_MODULE:-}" ]]; then
+    echo "Loading CUDA module '${CUDA_MODULE}'"
+    module load "${CUDA_MODULE}" || true
+  fi
+
+  if ! command -v nvcc >/dev/null 2>&1; then
+    echo "nvcc not detected; attempting to load default 'cuda' module"
+    module load cuda >/dev/null 2>&1 || true
+  fi
 fi
 
 # Discover nvcc and CUDA_HOME so setup.py builds the extension
