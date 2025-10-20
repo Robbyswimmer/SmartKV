@@ -310,14 +310,6 @@ def quantized_attention_bucketed(
             v_scale = view['v_scale'].to(query.device).contiguous()
             global_slots = view['global_slots'].to(query.device).contiguous()
 
-            if global_slots.numel() > 1:
-                order = torch.argsort(global_slots)
-                global_slots = global_slots.index_select(0, order).contiguous()
-                k_qx = k_qx.index_select(0, order).contiguous()
-                v_qx = v_qx.index_select(0, order).contiguous()
-                k_scale = k_scale.index_select(0, order).contiguous()
-                v_scale = v_scale.index_select(0, order).contiguous()
-
             # Determine if packed
             packed_flag = int(view.get('packed', torch.tensor(0, device=query.device)).item())
             packed_dim = int(view.get('packed_dim', torch.tensor(head_dim, device=query.device)).item())
@@ -333,6 +325,7 @@ def quantized_attention_bucketed(
                 v_qx = v_qx.view(size, num_heads, -1)
 
             # FIX ISSUE 1: Transpose scales from [H, num_tokens] to [num_tokens, H]
+            # IMPORTANT: Do this BEFORE sorting so index_select works on token dimension
             if k_scale.dim() == 2:
                 if k_scale.shape[0] == num_heads and k_scale.shape[1] == size:
                     # Need transpose: [H, num_tokens] -> [num_tokens, H]
@@ -348,6 +341,15 @@ def quantized_attention_bucketed(
                 if k_scale.shape[0] == num_heads and k_scale.shape[1] == size:
                     k_scale = k_scale.transpose(0, 1).contiguous()
                     v_scale = v_scale.transpose(0, 1).contiguous()
+
+            # NOW sort by global_slots (after transpose, so token dimension is first)
+            if global_slots.numel() > 1:
+                order = torch.argsort(global_slots)
+                global_slots = global_slots.index_select(0, order).contiguous()
+                k_qx = k_qx.index_select(0, order).contiguous()
+                v_qx = v_qx.index_select(0, order).contiguous()
+                k_scale = k_scale.index_select(0, order).contiguous()
+                v_scale = v_scale.index_select(0, order).contiguous()
 
             # Call bucket kernel - returns (unnormalized_output, m, s)
             bucket_out, m_bucket, l_bucket = smartkv_cuda.quantized_attention_bucket_forward(
@@ -371,14 +373,21 @@ def quantized_attention_bucketed(
             return torch.zeros_like(query)
 
         m_stack = torch.stack(bucket_ms, dim=0)
-        global_m = torch.nan_to_num(torch.amax(m_stack, dim=0), nan=0.0)
+        global_m = torch.amax(m_stack, dim=0)
+
+        # Handle case where all m values are -inf (no valid softmax)
+        # Replace -inf with 0 to avoid nan in exp(m - m) = exp(-inf - (-inf))
+        global_m = torch.where(torch.isneginf(global_m), torch.zeros_like(global_m), global_m)
 
         numerator = torch.zeros_like(bucket_outputs[0])
         denominator = torch.zeros_like(bucket_sums[0])
         for out_part, m_part, s_part in zip(bucket_outputs, bucket_ms, bucket_sums):
-            scale = torch.exp(m_part - global_m)
+            # Replace -inf in m_part with 0 to match global_m handling
+            m_part_safe = torch.where(torch.isneginf(m_part), torch.zeros_like(m_part), m_part)
+
+            scale = torch.exp(m_part_safe - global_m)
             numerator = numerator + out_part * scale.unsqueeze(-1)
-            denominator = denominator + torch.nan_to_num(s_part, nan=0.0) * scale
+            denominator = denominator + s_part * scale
 
         denom_expanded = denominator.unsqueeze(-1)
         output = torch.zeros_like(numerator)
