@@ -11,7 +11,7 @@
 #SBATCH --mail-user=rmose009@ucr.edu
 #SBATCH -p gpu
 
-set -euo pipefail
+set -eo pipefail  # -u breaks conda activate (ADDR2LINE unset in binutils script)
 
 # Activate conda environment
 if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
@@ -24,6 +24,27 @@ fi
 CONDA_ENV=${CONDA_ENV:-smartkv}
 echo "Activating conda environment '${CONDA_ENV}'"
 conda activate "${CONDA_ENV}"
+
+# Ensure consistent toolchain for CUDA builds/tests (matches profiling script)
+echo "Ensuring GCC 11 toolchain for CUDA..."
+conda install -y -c conda-forge gxx_linux-64=11 -q
+
+# Reactivate to pick up compiler wrappers
+conda deactivate
+conda activate "${CONDA_ENV}"
+
+# Export toolchain-related environment variables to avoid unbound var issues
+export PATH="${CONDA_PREFIX}/bin:${PATH}"
+export ADDR2LINE=${ADDR2LINE:-addr2line}
+export AR=${AR:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ar}
+export RANLIB=${RANLIB:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ranlib}
+export LD=${LD:-${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-ld}
+export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
+export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
+export CUDAHOSTCXX=${CXX}
+export NVCC_PREPEND_FLAGS="--compiler-bindir ${CXX}"
+export TORCH_NVCC_FLAGS="--compiler-bindir ${CXX}"
+echo "Using GCC toolchain: $(${CXX} --version | head -1)"
 
 echo "Starting SmartKV CUDA kernel unit tests at $(date)"
 
