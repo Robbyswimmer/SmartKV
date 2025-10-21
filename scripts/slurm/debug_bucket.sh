@@ -36,6 +36,15 @@ export CUDAHOSTCXX=${CXX}
 TORCH_LIB_DIR=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
 export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}"
 
+# Rebuild the CUDA extension to ensure it's fresh and properly linked
+echo "Rebuilding SmartKV CUDA extension..."
+rm -rf build smartkv_cuda.*.so
+python -m pip install -e . --no-deps --force-reinstall >/tmp/smartkv_debug_build.log 2>&1 || {
+  echo "❌ CUDA extension rebuild failed. See /tmp/smartkv_debug_build.log"
+  cat /tmp/smartkv_debug_build.log
+  exit 1
+}
+
 echo "=== Environment Info ==="
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
 echo "CUDA version: $(python -c 'import torch; print(torch.version.cuda)')"
