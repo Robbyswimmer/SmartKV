@@ -295,6 +295,11 @@ def quantized_attention_bucketed(
 
         total_tokens = 0
 
+        def _prepare_tensor(t: torch.Tensor) -> torch.Tensor:
+            if t.device != query.device:
+                t = t.to(query.device)
+            return t if t.is_contiguous() else t.contiguous()
+
         for bits in nonempty_bits:
             view = bucket_views[bits]
             size = view['token_ids'].numel()
@@ -304,11 +309,11 @@ def quantized_attention_bucketed(
             total_tokens += size
 
             # Extract bucket tensors (already transposed and sorted by get_bucket_views)
-            k_qx = view['k_qx'].to(query.device).contiguous()
-            v_qx = view['v_qx'].to(query.device).contiguous()
-            k_scale = view['k_scale'].to(query.device).contiguous()
-            v_scale = view['v_scale'].to(query.device).contiguous()
-            global_slots = view['global_slots'].to(query.device).contiguous()
+            k_qx = _prepare_tensor(view['k_qx'])
+            v_qx = _prepare_tensor(view['v_qx'])
+            k_scale = _prepare_tensor(view['k_scale'])
+            v_scale = _prepare_tensor(view['v_scale'])
+            global_slots = _prepare_tensor(view['global_slots'])
 
             # Determine if packed
             packed_flag = int(view.get('packed', torch.tensor(0, device=query.device)).item())
