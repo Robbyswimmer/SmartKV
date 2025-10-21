@@ -56,16 +56,23 @@ if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
   cd "${SLURM_SUBMIT_DIR}"
 fi
 
-# Load explicit CUDA module if requested; otherwise fall back to a generic cuda module if available
+# Load explicit CUDA module if requested; otherwise try common defaults
 if command -v module >/dev/null 2>&1; then
   if [[ -n "${CUDA_MODULE:-}" ]]; then
     echo "Loading CUDA module '${CUDA_MODULE}'"
-    module load "${CUDA_MODULE}" || true
+    module load "${CUDA_MODULE}" >/dev/null 2>&1 || echo "Warning: failed to load ${CUDA_MODULE}"
   fi
 
   if ! command -v nvcc >/dev/null 2>&1; then
-    echo "nvcc not detected; attempting to load default 'cuda' module"
-    module load cuda >/dev/null 2>&1 || true
+    echo "nvcc not detected; attempting to load a default CUDA module"
+    CUDA_MODULE_CANDIDATES=(cuda cuda/latest cuda/12.2 cuda/12.1 cuda/12.0 cuda/11.8 cuda/11.7 cuda/11.6)
+    for candidate in "${CUDA_MODULE_CANDIDATES[@]}"; do
+      module load "${candidate}" >/dev/null 2>&1 || continue
+      if command -v nvcc >/dev/null 2>&1; then
+        echo "Loaded CUDA module '${candidate}'"
+        break
+      fi
+    done
   fi
 fi
 
