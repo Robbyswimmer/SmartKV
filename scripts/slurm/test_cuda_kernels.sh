@@ -148,8 +148,8 @@ fi
 # Run benchmark if requested
 if [ "$RUN_BENCHMARK" = "true" ]; then
   echo ""
-  echo "Running bucket kernel benchmark..."
-  pytest tests/test_bucket_kernel_benchmark.py::test_bucket_kernel_vs_uniform_int8 \
+  echo "Running bucket kernel performance benchmark..."
+  pytest tests/test_bucket_perf.py::test_bucket_kernel_performance \
     -v \
     -s \
     | tee "$OUTPUT_ROOT/benchmark_output.txt"
