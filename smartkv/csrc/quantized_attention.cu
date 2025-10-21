@@ -75,51 +75,66 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* shared) {
 // On-the-fly unpacking helpers for bucket-aware kernel
 // ============================================================================
 
-// Unpack a single 2-bit value from packed byte
-__device__ __forceinline__ int8_t unpack_2bit_value(const uint8_t* packed, int idx) {
-    int byte_idx = idx / 4;
-    int bit_offset = (idx % 4) * 2;
-    uint8_t packed_byte = packed[byte_idx];
-    uint8_t unsigned_val = (packed_byte >> bit_offset) & 0x3;
-    return (int8_t)(unsigned_val - 2);  // [0,3] -> [-2,1]
-}
+// Packed bit-stream reader that amortizes bit extraction cost across elements.
+template<int BITS>
+struct PackedBitReader {
+    static_assert(BITS > 0 && BITS <= 7, "PackedBitReader only supports sub-byte widths");
 
-// Unpack a single 3-bit value from packed bytes
-__device__ __forceinline__ int8_t unpack_3bit_value(const uint8_t* packed, int idx) {
-    int bit_offset = idx * 3;
-    int byte_idx = bit_offset / 8;
-    int bit_in_byte = bit_offset % 8;
+    const uint8_t* ptr;
+    uint32_t buffer;
+    int bits_in_buffer;
 
-    // Read up to 2 bytes to get 3 bits
-    uint32_t window = 0;
-    window = packed[byte_idx];
-    if (bit_in_byte + 3 > 8) {
-        window |= ((uint32_t)packed[byte_idx + 1]) << 8;
+    __device__ __forceinline__ explicit PackedBitReader(const uint8_t* base)
+        : ptr(base), buffer(0), bits_in_buffer(0) {}
+
+    __device__ __forceinline__ int8_t next() {
+        constexpr int MASK = (1 << BITS) - 1;
+        constexpr int ZERO_POINT = 1 << (BITS - 1);
+
+        while (bits_in_buffer < BITS) {
+            buffer |= static_cast<uint32_t>(*ptr++) << bits_in_buffer;
+            bits_in_buffer += 8;
+        }
+
+        int raw = static_cast<int>(buffer & MASK);
+        buffer >>= BITS;
+        bits_in_buffer -= BITS;
+        return static_cast<int8_t>(raw - ZERO_POINT);
     }
-
-    uint8_t unsigned_val = (window >> bit_in_byte) & 0x7;
-    return (int8_t)(unsigned_val - 4);  // [0,7] -> [-4,3]
-}
-
-// Unpack a single 4-bit value from packed byte
-__device__ __forceinline__ int8_t unpack_4bit_value(const uint8_t* packed, int idx) {
-    int byte_idx = idx / 2;
-    int bit_offset = (idx % 2) * 4;
-    uint8_t packed_byte = packed[byte_idx];
-    uint8_t unsigned_val = (packed_byte >> bit_offset) & 0xF;
-    return (int8_t)(unsigned_val - 8);  // [0,15] -> [-8,7]
-}
+};
 
 // Generic unpacking dispatcher (compile-time template)
 template<int BITS>
 __device__ __forceinline__ int8_t unpack_value(const void* packed_ptr, int idx) {
     const uint8_t* packed = reinterpret_cast<const uint8_t*>(packed_ptr);
-    if (BITS == 2) {
-        return unpack_2bit_value(packed, idx);
-    } else if (BITS == 3) {
-        return unpack_3bit_value(packed, idx);
-    } else if (BITS == 4) {
-        return unpack_4bit_value(packed, idx);
+    if (BITS == 2 || BITS == 3 || BITS == 4) {
+        // Fallback to index-based extraction for random access (used rarely after introducing
+        // PackedBitReader for the streaming code-paths).
+        if (BITS == 2) {
+            int byte_idx = idx / 4;
+            int bit_offset = (idx % 4) * 2;
+            uint8_t packed_byte = packed[byte_idx];
+            uint8_t unsigned_val = (packed_byte >> bit_offset) & 0x3;
+            return static_cast<int8_t>(unsigned_val - 2);
+        } else if (BITS == 3) {
+            int bit_offset = idx * 3;
+            int byte_idx = bit_offset / 8;
+            int bit_in_byte = bit_offset % 8;
+
+            uint32_t window = packed[byte_idx];
+            if (bit_in_byte + 3 > 8) {
+                window |= static_cast<uint32_t>(packed[byte_idx + 1]) << 8;
+            }
+
+            uint8_t unsigned_val = (window >> bit_in_byte) & 0x7;
+            return static_cast<int8_t>(unsigned_val - 4);
+        } else {
+            int byte_idx = idx / 2;
+            int bit_offset = (idx % 2) * 4;
+            uint8_t packed_byte = packed[byte_idx];
+            uint8_t unsigned_val = (packed_byte >> bit_offset) & 0xF;
+            return static_cast<int8_t>(unsigned_val - 8);
+        }
     } else {
         // 8-bit: direct load as int8
         return reinterpret_cast<const int8_t*>(packed)[idx];
@@ -455,16 +470,24 @@ __global__ void quantized_attention_bucket_tiled_kernel(
 
     if (b >= B || h >= H || q_pos >= q_len) return;
 
-    // Shared memory layout:
-    // [0..d-1]: query vector
-    // [d..d+TILE_SIZE-1]: tile attention scores
-    // [d+TILE_SIZE..d+TILE_SIZE+31]: reduction scratch
-    // [d+TILE_SIZE+32..d+TILE_SIZE+32+d-1]: output accumulator (per-thread)
-    extern __shared__ float shared_mem[];
-    float* shared_query = shared_mem;
-    float* shared_scores = shared_mem + d;
-    float* shared_scratch = shared_mem + d + TILE_SIZE;
-    float* output_acc = shared_mem + d + TILE_SIZE + 32;
+    // Shared memory layout (float unless noted):
+    // [0..d-1]                     : query vector
+    // [d..2d-1]                    : output accumulator (per-thread)
+    // [2d..2d+TILE_SIZE-1]         : tile attention scores
+    // [2d+TILE_SIZE..2d+2*TILE_SIZE-1]   : key scales for active tile
+    // [2d+2*TILE_SIZE..2d+3*TILE_SIZE-1] : value scales for active tile
+    // [2d+3*TILE_SIZE..2d+3*TILE_SIZE+31]: reduction scratch space
+    // [ints next TILE_SIZE]              : cached global slot indices
+    // [following d floats]               : dequantized value tile
+    extern __shared__ unsigned char shared_raw[];
+    float* shared_query = reinterpret_cast<float*>(shared_raw);
+    float* output_acc = shared_query + d;
+    float* shared_scores = output_acc + d;
+    float* shared_key_scales = shared_scores + TILE_SIZE;
+    float* shared_value_scales = shared_key_scales + TILE_SIZE;
+    float* shared_scratch = shared_value_scales + TILE_SIZE;
+    int32_t* shared_slots = reinterpret_cast<int32_t*>(shared_scratch + 32);
+    float* shared_value_tile = reinterpret_cast<float*>(shared_slots + TILE_SIZE);
 
     // Load query to shared memory
     for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
@@ -487,6 +510,11 @@ __global__ void quantized_attention_bucket_tiled_kernel(
     // Number of tiles
     int num_tiles = (k_len + TILE_SIZE - 1) / TILE_SIZE;
 
+    int64_t mask_row_offset = 0;
+    if (attention_mask != nullptr) {
+        mask_row_offset = static_cast<int64_t>((b * 1 + 0) * q_len + q_pos) * full_k_len;
+    }
+
     (void)packed_dim;  // kept for API compatibility
 
     const uint8_t* key_base_u8 = reinterpret_cast<const uint8_t*>(key_qx);
@@ -502,44 +530,63 @@ __global__ void quantized_attention_bucket_tiled_kernel(
 
         __syncthreads();
 
+        // Stage scales (and slots if needed) for this tile into shared memory so that they can
+        // be reused without extra global reads in later phases.
+        for (int local_k = threadIdx.x; local_k < tile_size; local_k += blockDim.x) {
+            int k_pos = tile_start + local_k;
+            shared_key_scales[local_k] = key_scale[k_pos * H + h];
+            shared_value_scales[local_k] = value_scale[k_pos * H + h];
+            if (global_slots != nullptr) {
+                shared_slots[local_k] = static_cast<int32_t>(global_slots[k_pos]);
+            }
+        }
+        __syncthreads();
+
         // Phase 1: Compute attention scores for this tile (Q @ K^T)
         for (int local_k = threadIdx.x; local_k < tile_size; local_k += blockDim.x) {
             int k_pos = tile_start + local_k;
             float score = 0.0f;
 
             // Get scale for this key
-            int k_scale_offset = k_pos * H + h;
-            float k_scale_val = key_scale[k_scale_offset];
+            float k_scale_val = shared_key_scales[local_k];
 
             // Compute dot product with on-the-fly unpacking
             int64_t key_row_offset = static_cast<int64_t>(k_pos) * key_stride_tokens +
                                      static_cast<int64_t>(h) * key_stride_heads;
-            for (int d_idx = 0; d_idx < d; d_idx++) {
-                float q_val = shared_query[d_idx];
-
-                // Unpack key value
-                int8_t k_q_val;
-                if (is_packed && BITS < 8) {
-                    // Packed: unpack from packed buffer
-                    const uint8_t* k_packed_row = key_base_u8 + key_row_offset;
-                    k_q_val = unpack_value<BITS>(k_packed_row, d_idx);
-                } else {
-                    // INT8 storage
-                    int64_t k_offset = key_row_offset + static_cast<int64_t>(d_idx) * key_stride_dim;
-                    k_q_val = key_base_i8[k_offset];
+            if (is_packed && BITS < 8) {
+                const uint8_t* k_packed_row = key_base_u8 + key_row_offset;
+                PackedBitReader<BITS> reader(k_packed_row);
+                for (int d_idx = 0; d_idx < d; d_idx++) {
+                    float q_val = shared_query[d_idx];
+                    int8_t k_q_val = reader.next();
+                    float k_val = static_cast<float>(k_q_val) * k_scale_val;
+                    score += q_val * k_val;
                 }
-
-                float k_val = (float)k_q_val * k_scale_val;
-                score += q_val * k_val;
+            } else {
+                const int8_t* k_row_ptr = key_base_i8 + key_row_offset;
+                if (key_stride_dim == 1) {
+                    for (int d_idx = 0; d_idx < d; d_idx++) {
+                        float q_val = shared_query[d_idx];
+                        int8_t k_q_val = k_row_ptr[d_idx];
+                        float k_val = static_cast<float>(k_q_val) * k_scale_val;
+                        score += q_val * k_val;
+                    }
+                } else {
+                    for (int d_idx = 0; d_idx < d; d_idx++) {
+                        float q_val = shared_query[d_idx];
+                        int8_t k_q_val = k_row_ptr[d_idx * key_stride_dim];
+                        float k_val = static_cast<float>(k_q_val) * k_scale_val;
+                        score += q_val * k_val;
+                    }
+                }
             }
 
             score *= inv_sqrt_d;
 
             // Apply attention mask if provided
             if (attention_mask != nullptr) {
-                int slot = global_slots != nullptr ? static_cast<int>(global_slots[k_pos]) : k_pos;
-                int mask_offset = ((b * 1 + 0) * q_len + q_pos) * full_k_len + slot;
-                score += attention_mask[mask_offset];
+                int slot = global_slots != nullptr ? shared_slots[local_k] : k_pos;
+                score += attention_mask[mask_row_offset + static_cast<int64_t>(slot)];
             }
 
             shared_scores[local_k] = score;
@@ -594,37 +641,42 @@ __global__ void quantized_attention_bucket_tiled_kernel(
 
         // Phase 3: Accumulate attention @ V for this tile
         __syncthreads();
-        for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
-            float v_acc = 0.0f;
-            for (int local_k = 0; local_k < tile_size; local_k++) {
-                int k_pos = tile_start + local_k;
-                float prob = shared_scores[local_k];
+        for (int local_k = 0; local_k < tile_size; local_k++) {
+            int k_pos = tile_start + local_k;
+            float prob = shared_scores[local_k];
+            float v_scale_val = shared_value_scales[local_k];
 
-                // Get scale for this value
-                int v_scale_offset = k_pos * H + h;
-                float v_scale_val = value_scale[v_scale_offset];
+            int64_t value_row_base = static_cast<int64_t>(k_pos) * value_stride_tokens +
+                                     static_cast<int64_t>(h) * value_stride_heads;
 
-                // Unpack value
-                int8_t v_q_val;
-                if (is_packed && BITS < 8) {
-                    // Packed: unpack from packed buffer
-                    int64_t value_row_offset = static_cast<int64_t>(k_pos) * value_stride_tokens +
-                                              static_cast<int64_t>(h) * value_stride_heads;
-                    const uint8_t* v_packed_row = value_base_u8 + value_row_offset;
-                    v_q_val = unpack_value<BITS>(v_packed_row, d_idx);
-                } else {
-                    // INT8 storage
-                    int64_t value_row_offset = static_cast<int64_t>(k_pos) * value_stride_tokens +
-                                              static_cast<int64_t>(h) * value_stride_heads +
-                                              static_cast<int64_t>(d_idx) * value_stride_dim;
-                    v_q_val = value_base_i8[value_row_offset];
+            if (is_packed && BITS < 8) {
+                if (threadIdx.x == 0) {
+                    PackedBitReader<BITS> reader(value_base_u8 + value_row_base);
+                    for (int d_idx = 0; d_idx < d; d_idx++) {
+                        int8_t v_q_val = reader.next();
+                        shared_value_tile[d_idx] = static_cast<float>(v_q_val) * v_scale_val;
+                    }
                 }
-
-                float v_val = (float)v_q_val * v_scale_val;
-                v_acc += prob * v_val;
+            } else {
+                const int8_t* v_row_ptr = value_base_i8 + value_row_base;
+                if (value_stride_dim == 1) {
+                    for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
+                        int8_t v_q_val = v_row_ptr[d_idx];
+                        shared_value_tile[d_idx] = static_cast<float>(v_q_val) * v_scale_val;
+                    }
+                } else {
+                    for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
+                        int8_t v_q_val = v_row_ptr[d_idx * value_stride_dim];
+                        shared_value_tile[d_idx] = static_cast<float>(v_q_val) * v_scale_val;
+                    }
+                }
             }
+            __syncthreads();
 
-            output_acc[d_idx] += v_acc;
+            for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
+                output_acc[d_idx] += prob * shared_value_tile[d_idx];
+            }
+            __syncthreads();
         }
     }
 
@@ -669,11 +721,14 @@ void launch_bucket_kernel(
 
     // Kernel launch configuration
     dim3 grid(B, H, q_len);
-    int block_size = std::min(256, std::max(32, (int)d));
+    int block_size = std::min(256, std::max(32, static_cast<int>(k_len)));
+    block_size = ((block_size + 31) / 32) * 32;
     dim3 block(block_size);
 
-    // Shared memory: query + tile scores + scratch + output accumulator
-    size_t shared_mem_size = (d + TILE_SIZE + 32 + d) * sizeof(float);
+    // Shared memory: query + output accumulator + scores + scales + scratch + value tile + slots
+    size_t shared_mem_floats = static_cast<size_t>(3 * d + 3 * TILE_SIZE + 32);
+    size_t shared_mem_ints = static_cast<size_t>(TILE_SIZE);
+    size_t shared_mem_size = shared_mem_floats * sizeof(float) + shared_mem_ints * sizeof(int32_t);
 
     const float* query_ptr = query.data_ptr<float>();
     const void* key_qx_ptr = key_qx.data_ptr();
@@ -782,10 +837,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> quantized_attention_buck
         full_k_len = k_len;
     }
 
-    // Allocate output (unnormalized) and softmax statistics
-    auto output = torch::zeros_like(query);
-    auto m_out = torch::zeros({B, H, q_len}, query.options());
-    auto s_out = torch::zeros({B, H, q_len}, query.options());
+    // Allocate output (unnormalized) and softmax statistics without redundant zero fill
+    auto output = torch::empty_like(query);
+    auto m_out = torch::empty({B, H, q_len}, query.options());
+    auto s_out = torch::empty({B, H, q_len}, query.options());
 
     // Launch kernel for this bucket
     launch_bucket_kernel(bits, query, key_qx, key_scale, value_qx, value_scale,
