@@ -34,7 +34,7 @@ export CUDAHOSTCXX=${CXX}
 export NVCC_PREPEND_FLAGS="--compiler-bindir ${CXX}"
 export TORCH_NVCC_FLAGS="--compiler-bindir ${CXX}"
 
-# Load CUDA module (needed for nvcc during build)
+# Load CUDA module if available (needed for nvcc during build)
 if command -v module >/dev/null 2>&1; then
   CUDA_MODULE_CANDIDATES=(cuda cuda/latest cuda/12.2 cuda/12.1 cuda/12.0 cuda/11.8)
   for candidate in "${CUDA_MODULE_CANDIDATES[@]}"; do
@@ -46,14 +46,13 @@ if command -v module >/dev/null 2>&1; then
   done
 fi
 
-# Set CUDA_HOME
+# Set CUDA_HOME if nvcc is found
 if command -v nvcc >/dev/null 2>&1; then
   NVCC_PATH=$(command -v nvcc)
   export CUDA_HOME="${CUDA_HOME:-$(dirname "${NVCC_PATH}")/..}"
   echo "CUDA_HOME=${CUDA_HOME}"
 else
-  echo "❌ nvcc not found, CUDA extension build will fail"
-  exit 1
+  echo "Warning: nvcc not found in PATH. Build may still succeed if CUDA is in default location."
 fi
 
 # Add PyTorch lib directory to LD_LIBRARY_PATH so libc10.so and other torch libs can be found
