@@ -60,45 +60,37 @@ if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
   cd "${SLURM_SUBMIT_DIR}"
 fi
 
-# Load explicit CUDA module if requested; otherwise try common defaults
-if command -v module >/dev/null 2>&1; then
-  if [[ -n "${CUDA_MODULE:-}" ]]; then
-    echo "Loading CUDA module '${CUDA_MODULE}'"
-    module load "${CUDA_MODULE}" >/dev/null 2>&1 || echo "Warning: failed to load ${CUDA_MODULE}"
-  fi
+# Check CUDA availability (PyTorch should find it on GPU nodes)
+echo "Checking CUDA availability..."
+python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_available()}')"
 
-  if ! command -v nvcc >/dev/null 2>&1; then
-    echo "nvcc not detected; attempting to load a default CUDA module"
-    CUDA_MODULE_CANDIDATES=(cuda cuda/latest cuda/12.2 cuda/12.1 cuda/12.0 cuda/11.8 cuda/11.7 cuda/11.6)
-    for candidate in "${CUDA_MODULE_CANDIDATES[@]}"; do
-      module load "${candidate}" >/dev/null 2>&1 || continue
-      if command -v nvcc >/dev/null 2>&1; then
-        echo "Loaded CUDA module '${candidate}'"
-        break
-      fi
-    done
-  fi
-fi
-
-# Discover nvcc and CUDA_HOME so setup.py builds the extension
-if command -v nvcc >/dev/null 2>&1; then
-  NVCC_PATH=$(command -v nvcc)
-  export CUDA_HOME="${CUDA_HOME:-$(dirname "${NVCC_PATH}")/..}"
-  echo "Detected nvcc at ${NVCC_PATH}"
-  echo "Setting CUDA_HOME=${CUDA_HOME}"
-else
-  echo "❌ nvcc not found on PATH. Please load a CUDA module (set CUDA_MODULE) or export CUDA_HOME before submitting."
-  exit 1
-fi
-
-echo "Rebuilding SmartKV CUDA extension (force fresh .so for this job)..."
+# Rebuild CUDA extension (PyTorch's build system will find CUDA)
+echo "Rebuilding SmartKV CUDA extension..."
 rm -rf build smartkv_cuda.*.so
 LOG_SUFFIX=${SLURM_JOB_ID:-$$}
-python -m pip install -e . --no-deps --force-reinstall >/tmp/smartkv_cuda_build_${LOG_SUFFIX}.log 2>&1 || {
+pip install -e . --no-build-isolation >/tmp/smartkv_cuda_build_${LOG_SUFFIX}.log 2>&1 || {
   echo "❌ CUDA extension rebuild failed. See /tmp/smartkv_cuda_build_${LOG_SUFFIX}.log"
   cat /tmp/smartkv_cuda_build_${LOG_SUFFIX}.log
   exit 1
 }
+
+# Ensure build completes with explicit build_ext
+CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace >>/tmp/smartkv_cuda_build_${LOG_SUFFIX}.log 2>&1
+
+# Find and verify .so file
+SO_FILE=$(find . -name "smartkv_cuda*.so" -type f 2>/dev/null | head -1)
+if [[ -n "${SO_FILE}" ]]; then
+  echo "Found extension: ${SO_FILE}"
+else
+  echo "❌ No .so file found after build!"
+  cat /tmp/smartkv_cuda_build_${LOG_SUFFIX}.log
+  exit 1
+fi
+
+# Add project root to PYTHONPATH
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
+
+# Verify extension loads
 python - <<'PY'
 import smartkv_cuda
 print("Loaded smartkv_cuda from:", smartkv_cuda.__file__)
