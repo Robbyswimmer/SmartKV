@@ -31,19 +31,59 @@ export PATH="${CONDA_PREFIX}/bin:${PATH}"
 export CC=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-gcc
 export CXX=${CONDA_PREFIX}/bin/x86_64-conda-linux-gnu-g++
 export CUDAHOSTCXX=${CXX}
+export NVCC_PREPEND_FLAGS="--compiler-bindir ${CXX}"
+export TORCH_NVCC_FLAGS="--compiler-bindir ${CXX}"
+
+# Load CUDA module (needed for nvcc during build)
+if command -v module >/dev/null 2>&1; then
+  CUDA_MODULE_CANDIDATES=(cuda cuda/latest cuda/12.2 cuda/12.1 cuda/12.0 cuda/11.8)
+  for candidate in "${CUDA_MODULE_CANDIDATES[@]}"; do
+    module load "${candidate}" >/dev/null 2>&1 || continue
+    if command -v nvcc >/dev/null 2>&1; then
+      echo "Loaded CUDA module '${candidate}'"
+      break
+    fi
+  done
+fi
+
+# Set CUDA_HOME
+if command -v nvcc >/dev/null 2>&1; then
+  NVCC_PATH=$(command -v nvcc)
+  export CUDA_HOME="${CUDA_HOME:-$(dirname "${NVCC_PATH}")/..}"
+  echo "CUDA_HOME=${CUDA_HOME}"
+else
+  echo "❌ nvcc not found, CUDA extension build will fail"
+  exit 1
+fi
 
 # Add PyTorch lib directory to LD_LIBRARY_PATH so libc10.so and other torch libs can be found
 TORCH_LIB_DIR=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
 export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}"
 
-# Rebuild the CUDA extension to ensure it's fresh and properly linked
+# Rebuild the CUDA extension
 echo "Rebuilding SmartKV CUDA extension..."
 rm -rf build smartkv_cuda.*.so
-python -m pip install -e . --no-deps --force-reinstall >/tmp/smartkv_debug_build.log 2>&1 || {
+pip install -e . --no-build-isolation >/tmp/smartkv_debug_build.log 2>&1 || {
   echo "❌ CUDA extension rebuild failed. See /tmp/smartkv_debug_build.log"
   cat /tmp/smartkv_debug_build.log
   exit 1
 }
+
+# Ensure build completes with explicit build_ext
+CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace >>/tmp/smartkv_debug_build.log 2>&1
+
+# Find and verify .so file
+SO_FILE=$(find . -name "smartkv_cuda*.so" -type f 2>/dev/null | head -1)
+if [[ -n "${SO_FILE}" ]]; then
+  echo "Found extension: ${SO_FILE}"
+else
+  echo "❌ No .so file found after build!"
+  cat /tmp/smartkv_debug_build.log
+  exit 1
+fi
+
+# Add project root to PYTHONPATH
+export PYTHONPATH="${PWD}:${PYTHONPATH}"
 
 echo "=== Environment Info ==="
 echo "CUDA available: $(python -c 'import torch; print(torch.cuda.is_available())')"
