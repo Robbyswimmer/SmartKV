@@ -67,15 +67,19 @@ python -c "import torch; print(f'PyTorch CUDA available: {torch.cuda.is_availabl
 # Rebuild CUDA extension (PyTorch's build system will find CUDA)
 echo "Rebuilding SmartKV CUDA extension..."
 rm -rf build smartkv_cuda.*.so
+# Also clear pip cache and egg-info to force rebuild
+rm -rf smartkv.egg-info dist *.egg-info
 LOG_SUFFIX=${SLURM_JOB_ID:-$$}
-pip install -e . --no-build-isolation >/tmp/smartkv_cuda_build_${LOG_SUFFIX}.log 2>&1 || {
+
+# Force rebuild by touching source files
+touch smartkv/csrc/*.cu smartkv/csrc/*.cpp smartkv/csrc/*.h
+
+# Build with explicit force flag
+CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace --force >/tmp/smartkv_cuda_build_${LOG_SUFFIX}.log 2>&1 || {
   echo "❌ CUDA extension rebuild failed. See /tmp/smartkv_cuda_build_${LOG_SUFFIX}.log"
   cat /tmp/smartkv_cuda_build_${LOG_SUFFIX}.log
   exit 1
 }
-
-# Ensure build completes with explicit build_ext
-CUDAHOSTCXX=${CXX} python setup.py build_ext --inplace >>/tmp/smartkv_cuda_build_${LOG_SUFFIX}.log 2>&1
 
 # Find and verify .so file
 SO_FILE=$(find . -name "smartkv_cuda*.so" -type f 2>/dev/null | head -1)
