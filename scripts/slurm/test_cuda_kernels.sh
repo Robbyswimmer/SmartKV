@@ -46,6 +46,10 @@ export NVCC_PREPEND_FLAGS="--compiler-bindir ${CXX}"
 export TORCH_NVCC_FLAGS="--compiler-bindir ${CXX}"
 echo "Using GCC toolchain: $(${CXX} --version | head -1)"
 
+# Add PyTorch lib directory to LD_LIBRARY_PATH so libc10.so and other torch libs can be found
+TORCH_LIB_DIR=$(python -c "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))")
+export LD_LIBRARY_PATH="${TORCH_LIB_DIR}:${LD_LIBRARY_PATH}"
+
 echo "Starting SmartKV CUDA kernel unit tests at $(date)"
 
 # Create logs directory
