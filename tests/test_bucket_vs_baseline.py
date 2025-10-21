@@ -93,8 +93,9 @@ def test_smartkv_vs_int8_vs_fp16():
             token_ids = list(range(start, start + size))
 
             # Generate same random data for all approaches
-            k = torch.randn(size, num_heads, head_dim, device=device, dtype=torch.float16)
-            v = torch.randn(size, num_heads, head_dim, device=device, dtype=torch.float16)
+            # Note: Quantization expects float32 input
+            k = torch.randn(size, num_heads, head_dim, device=device, dtype=torch.float32)
+            v = torch.randn(size, num_heads, head_dim, device=device, dtype=torch.float32)
 
             # SmartKV: allocate adaptive precision
             smartkv_cache.allocate_precision(0, token_ids)
@@ -113,8 +114,8 @@ def test_smartkv_vs_int8_vs_fp16():
         fp16_k = torch.cat(fp16_k_list, dim=0)  # [ctx_len, num_heads, head_dim]
         fp16_v = torch.cat(fp16_v_list, dim=0)
 
-        # Query tensor
-        query = torch.randn(1, num_heads, 1, head_dim, device=device, dtype=torch.float16)
+        # Query tensor (float32 for quantized kernels)
+        query = torch.randn(1, num_heads, 1, head_dim, device=device, dtype=torch.float32)
 
         # ================================================================
         # Benchmark 1: SmartKV (bucketed, mixed precision)
@@ -231,9 +232,10 @@ def test_smartkv_vs_int8_vs_fp16():
         print("\n[3] FP16 baseline (PyTorch standard attention):")
 
         # Reshape for PyTorch attention: [B, H, seq_len, head_dim]
-        fp16_k_attn = fp16_k.unsqueeze(0).transpose(1, 2)  # [1, num_heads, ctx_len, head_dim]
-        fp16_v_attn = fp16_v.unsqueeze(0).transpose(1, 2)
-        query_attn = query  # Already [1, num_heads, 1, head_dim]
+        # Convert to FP16 for fair FP16 baseline comparison
+        fp16_k_attn = fp16_k.unsqueeze(0).transpose(1, 2).half()  # [1, num_heads, ctx_len, head_dim]
+        fp16_v_attn = fp16_v.unsqueeze(0).transpose(1, 2).half()
+        query_attn = query.half()  # Convert to FP16 for FP16 baseline
 
         # Correctness check
         fp16_out = torch.nn.functional.scaled_dot_product_attention(
