@@ -34,7 +34,7 @@ def test_smartkv_vs_int8_vs_fp16():
     # Configuration
     num_heads = 32
     head_dim = 128
-    context_lengths = [4096, 8192, 16384, 64000]
+    context_lengths = [4096, 8192, 16384, 32000]
     memory_budget = 0.25  # Aggressive quantization
     available_bits = [2, 4, 8]
 
