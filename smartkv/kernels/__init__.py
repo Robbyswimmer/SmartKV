@@ -303,7 +303,7 @@ def quantized_attention_bucketed(
 
             total_tokens += size
 
-            # Extract bucket tensors
+            # Extract bucket tensors (already transposed and sorted by get_bucket_views)
             k_qx = view['k_qx'].to(query.device).contiguous()
             v_qx = view['v_qx'].to(query.device).contiguous()
             k_scale = view['k_scale'].to(query.device).contiguous()
@@ -323,33 +323,6 @@ def quantized_attention_bucketed(
                 # Needs reshaping
                 k_qx = k_qx.view(size, num_heads, -1)
                 v_qx = v_qx.view(size, num_heads, -1)
-
-            # FIX ISSUE 1: Transpose scales from [H, num_tokens] to [num_tokens, H]
-            # IMPORTANT: Do this BEFORE sorting so index_select works on token dimension
-            if k_scale.dim() == 2:
-                if k_scale.shape[0] == num_heads and k_scale.shape[1] == size:
-                    # Need transpose: [H, num_tokens] -> [num_tokens, H]
-                    k_scale = k_scale.transpose(0, 1).contiguous()
-                    v_scale = v_scale.transpose(0, 1).contiguous()
-                elif k_scale.shape[0] == size and k_scale.shape[1] == num_heads:
-                    # Already correct
-                    pass
-            elif k_scale.dim() == 3:
-                k_scale = k_scale.squeeze(0)
-                v_scale = v_scale.squeeze(0)
-                # Check and transpose if needed after squeeze
-                if k_scale.shape[0] == num_heads and k_scale.shape[1] == size:
-                    k_scale = k_scale.transpose(0, 1).contiguous()
-                    v_scale = v_scale.transpose(0, 1).contiguous()
-
-            # NOW sort by global_slots (after transpose, so token dimension is first)
-            if global_slots.numel() > 1:
-                order = torch.argsort(global_slots)
-                global_slots = global_slots.index_select(0, order).contiguous()
-                k_qx = k_qx.index_select(0, order).contiguous()
-                v_qx = v_qx.index_select(0, order).contiguous()
-                k_scale = k_scale.index_select(0, order).contiguous()
-                v_scale = v_scale.index_select(0, order).contiguous()
 
             # Call bucket kernel - returns (unnormalized_output, m, s)
             bucket_out, m_bucket, l_bucket = smartkv_cuda.quantized_attention_bucket_forward(

@@ -425,7 +425,7 @@ std::tuple<torch::Tensor, torch::Tensor> quantize_per_head_forward(
 // Bucket-aware tiled attention kernel with streaming softmax
 // ============================================================================
 
-template<int BITS, int TILE_SIZE = 128>
+template<int BITS, int TILE_SIZE = 64>
 __global__ void quantized_attention_bucket_tiled_kernel(
     const float* __restrict__ query,           // [B, H, q_len, d]
     const void* __restrict__ key_qx,           // [num_tokens, H, packed_dim] (uint8 if packed, int8 if not)
@@ -644,7 +644,7 @@ __global__ void quantized_attention_bucket_tiled_kernel(
 }
 
 // Helper to launch bucket kernel with appropriate template instantiation
-template<int TILE_SIZE = 128>
+template<int TILE_SIZE = 64>
 void launch_bucket_kernel(
     int bits,
     torch::Tensor query,

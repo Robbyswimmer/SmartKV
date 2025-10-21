@@ -577,21 +577,56 @@ class SmartKVCache:
                 continue
             device = buffers['token_ids'].device
 
+            # Extract tensors
+            k_scale = buffers['k_scale'][:size].clone()
+            v_scale = buffers['v_scale'][:size].clone()
+            global_slots = buffers['global_slots'][:size].clone()
+
+            # Transpose scales if needed: [H, num_tokens] -> [num_tokens, H]
+            # Scales should be [num_tokens, H] for kernel
+            if k_scale.dim() == 2:
+                if k_scale.shape[0] == self.num_heads and k_scale.shape[1] == size:
+                    # Need transpose: [H, num_tokens] -> [num_tokens, H]
+                    k_scale = k_scale.transpose(0, 1).contiguous()
+                    v_scale = v_scale.transpose(0, 1).contiguous()
+                elif k_scale.shape[0] == size and k_scale.shape[1] == self.num_heads:
+                    # Already correct shape
+                    pass
+
+            # Sort by global_slots for sequential access
+            if global_slots.numel() > 1:
+                order = torch.argsort(global_slots)
+                global_slots = global_slots.index_select(0, order).contiguous()
+                k_scale = k_scale.index_select(0, order).contiguous()
+                v_scale = v_scale.index_select(0, order).contiguous()
+
+                # Sort k_qx and v_qx as well
+                if self.use_packing and bits < 8 and PACKING_AVAILABLE:
+                    k_qx_sorted = buffers['k_qx'][:size].index_select(0, order).clone()
+                    v_qx_sorted = buffers['v_qx'][:size].index_select(0, order).clone()
+                else:
+                    k_qx_sorted = buffers['k_qx'][:size].index_select(0, order).clone()
+                    v_qx_sorted = buffers['v_qx'][:size].index_select(0, order).clone()
+
+                token_ids_sorted = buffers['token_ids'][:size].index_select(0, order).clone()
+            else:
+                k_qx_sorted = buffers['k_qx'][:size].clone()
+                v_qx_sorted = buffers['v_qx'][:size].clone()
+                token_ids_sorted = buffers['token_ids'][:size].clone()
+
             views: Dict[str, torch.Tensor] = {
-                'token_ids': buffers['token_ids'][:size].clone(),
-                'global_slots': buffers['global_slots'][:size].clone(),
-                'k_scale': buffers['k_scale'][:size].clone(),
-                'v_scale': buffers['v_scale'][:size].clone(),
+                'token_ids': token_ids_sorted,
+                'global_slots': global_slots,
+                'k_scale': k_scale,
+                'v_scale': v_scale,
+                'k_qx': k_qx_sorted,
+                'v_qx': v_qx_sorted,
             }
 
             if self.use_packing and bits < 8 and PACKING_AVAILABLE:
-                views['k_qx'] = buffers['k_qx'][:size].clone()
-                views['v_qx'] = buffers['v_qx'][:size].clone()
                 views['packed_dim'] = torch.tensor(buffers['packed_dim'], device=device)
                 views['packed'] = torch.tensor(1, device=device)
             else:
-                views['k_qx'] = buffers['k_qx'][:size].clone()
-                views['v_qx'] = buffers['v_qx'][:size].clone()
                 views['packed_dim'] = torch.tensor(self.head_dim, device=device)
                 views['packed'] = torch.tensor(0, device=device)
 
