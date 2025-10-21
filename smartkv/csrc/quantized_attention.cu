@@ -553,16 +553,22 @@ __global__ void quantized_attention_bucket_tiled_kernel(
             // Compute dot product with on-the-fly unpacking
             int64_t key_row_offset = static_cast<int64_t>(k_pos) * key_stride_tokens +
                                      static_cast<int64_t>(h) * key_stride_heads;
-            if (is_packed && BITS < 8) {
-                const uint8_t* k_packed_row = key_base_u8 + key_row_offset;
-                PackedBitReader<BITS> reader(k_packed_row);
-                for (int d_idx = 0; d_idx < d; d_idx++) {
-                    float q_val = shared_query[d_idx];
-                    int8_t k_q_val = reader.next();
-                    float k_val = static_cast<float>(k_q_val) * k_scale_val;
-                    score += q_val * k_val;
+            bool used_packed_reader = false;
+            if constexpr (BITS < 8) {
+                if (is_packed) {
+                    const uint8_t* k_packed_row = key_base_u8 + key_row_offset;
+                    PackedBitReader<BITS> reader(k_packed_row);
+                    for (int d_idx = 0; d_idx < d; d_idx++) {
+                        float q_val = shared_query[d_idx];
+                        int8_t k_q_val = reader.next();
+                        float k_val = static_cast<float>(k_q_val) * k_scale_val;
+                        score += q_val * k_val;
+                    }
+                    used_packed_reader = true;
                 }
-            } else {
+            }
+
+            if (!used_packed_reader) {
                 const int8_t* k_row_ptr = key_base_i8 + key_row_offset;
                 if (key_stride_dim == 1) {
                     for (int d_idx = 0; d_idx < d; d_idx++) {
@@ -649,15 +655,21 @@ __global__ void quantized_attention_bucket_tiled_kernel(
             int64_t value_row_base = static_cast<int64_t>(k_pos) * value_stride_tokens +
                                      static_cast<int64_t>(h) * value_stride_heads;
 
-            if (is_packed && BITS < 8) {
-                if (threadIdx.x == 0) {
-                    PackedBitReader<BITS> reader(value_base_u8 + value_row_base);
-                    for (int d_idx = 0; d_idx < d; d_idx++) {
-                        int8_t v_q_val = reader.next();
-                        shared_value_tile[d_idx] = static_cast<float>(v_q_val) * v_scale_val;
+            bool used_packed_value = false;
+            if constexpr (BITS < 8) {
+                if (is_packed) {
+                    if (threadIdx.x == 0) {
+                        PackedBitReader<BITS> reader(value_base_u8 + value_row_base);
+                        for (int d_idx = 0; d_idx < d; d_idx++) {
+                            int8_t v_q_val = reader.next();
+                            shared_value_tile[d_idx] = static_cast<float>(v_q_val) * v_scale_val;
+                        }
                     }
+                    used_packed_value = true;
                 }
-            } else {
+            }
+
+            if (!used_packed_value) {
                 const int8_t* v_row_ptr = value_base_i8 + value_row_base;
                 if (value_stride_dim == 1) {
                     for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
