@@ -171,6 +171,10 @@ def test_smartkv_vs_int8_vs_fp16():
             print(f" {bits}b:{count}({pct:.1f}%)", end="")
         print()
 
+        # Clean up SmartKV cache to free memory
+        del smartkv_cache, smartkv_buckets, smartkv_out
+        torch.cuda.empty_cache()
+
         # ================================================================
         # Benchmark 2: Standard INT8 (non-bucketed, legacy kernel)
         # ================================================================
@@ -226,49 +230,67 @@ def test_smartkv_vs_int8_vs_fp16():
         print(f"  Latency (p95): {int8_p95:.3f} ms")
         print(f"  Memory ratio:  0.500 (uniform INT8)")
 
+        # Clean up INT8 cache to free memory
+        del int8_cache, int8_data, int8_out
+        torch.cuda.empty_cache()
+
         # ================================================================
         # Benchmark 3: FP16 baseline (PyTorch standard attention)
         # ================================================================
-        print("\n[3] FP16 baseline (PyTorch standard attention):")
+        # Skip FP16 at very long contexts to avoid OOM
+        if ctx_len >= 32000:
+            print("\n[3] FP16 baseline (PyTorch standard attention):")
+            print("  Skipped at 64K context to avoid OOM")
+            fp16_latency = float('nan')
+            fp16_p50 = float('nan')
+            fp16_p95 = float('nan')
+        else:
+            print("\n[3] FP16 baseline (PyTorch standard attention):")
 
-        # Reshape for PyTorch attention: [B, H, seq_len, head_dim]
-        # Convert to FP16 for fair FP16 baseline comparison
-        fp16_k_attn = fp16_k.unsqueeze(0).transpose(1, 2).half()  # [1, num_heads, ctx_len, head_dim]
-        fp16_v_attn = fp16_v.unsqueeze(0).transpose(1, 2).half()
-        query_attn = query.half()  # Convert to FP16 for FP16 baseline
+            # Reshape for PyTorch attention: [B, H, seq_len, head_dim]
+            # Convert to FP16 for fair FP16 baseline comparison
+            fp16_k_attn = fp16_k.unsqueeze(0).transpose(1, 2).half()  # [1, num_heads, ctx_len, head_dim]
+            fp16_v_attn = fp16_v.unsqueeze(0).transpose(1, 2).half()
+            query_attn = query.half()  # Convert to FP16 for FP16 baseline
 
-        # Correctness check
-        fp16_out = torch.nn.functional.scaled_dot_product_attention(
-            query_attn, fp16_k_attn, fp16_v_attn
-        )
-        assert not torch.isnan(fp16_out).any(), "FP16 output contains NaN"
-        assert not torch.isinf(fp16_out).any(), "FP16 output contains Inf"
-
-        # Warmup
-        for _ in range(10):
-            _ = torch.nn.functional.scaled_dot_product_attention(
+            # Correctness check
+            fp16_out = torch.nn.functional.scaled_dot_product_attention(
                 query_attn, fp16_k_attn, fp16_v_attn
             )
-        torch.cuda.synchronize()
+            assert not torch.isnan(fp16_out).any(), "FP16 output contains NaN"
+            assert not torch.isinf(fp16_out).any(), "FP16 output contains Inf"
 
-        # Benchmark
-        times = []
-        for _ in range(iters):
-            start = perf_counter()
-            _ = torch.nn.functional.scaled_dot_product_attention(
-                query_attn, fp16_k_attn, fp16_v_attn
-            )
+            # Warmup
+            for _ in range(10):
+                _ = torch.nn.functional.scaled_dot_product_attention(
+                    query_attn, fp16_k_attn, fp16_v_attn
+                )
             torch.cuda.synchronize()
-            times.append(perf_counter() - start)
 
-        fp16_latency = sum(times) / len(times) * 1000
-        fp16_p50 = sorted(times)[len(times)//2] * 1000
-        fp16_p95 = sorted(times)[int(len(times)*0.95)] * 1000
+            # Benchmark
+            times = []
+            for _ in range(iters):
+                start = perf_counter()
+                _ = torch.nn.functional.scaled_dot_product_attention(
+                    query_attn, fp16_k_attn, fp16_v_attn
+                )
+                torch.cuda.synchronize()
+                times.append(perf_counter() - start)
 
-        print(f"  Latency (avg): {fp16_latency:.3f} ms")
-        print(f"  Latency (p50): {fp16_p50:.3f} ms")
-        print(f"  Latency (p95): {fp16_p95:.3f} ms")
-        print(f"  Memory ratio:  1.000 (FP16 baseline)")
+            fp16_latency = sum(times) / len(times) * 1000
+            fp16_p50 = sorted(times)[len(times)//2] * 1000
+            fp16_p95 = sorted(times)[int(len(times)*0.95)] * 1000
+
+            print(f"  Latency (avg): {fp16_latency:.3f} ms")
+            print(f"  Latency (p50): {fp16_p50:.3f} ms")
+            print(f"  Latency (p95): {fp16_p95:.3f} ms")
+            print(f"  Memory ratio:  1.000 (FP16 baseline)")
+
+        # Clean up FP16 tensors to free memory
+        if 'fp16_k_attn' in locals():
+            del fp16_k_attn, fp16_v_attn, query_attn, fp16_out
+        del fp16_k, fp16_v, fp16_k_list, fp16_v_list
+        torch.cuda.empty_cache()
 
         # ================================================================
         # Summary for this context length
@@ -276,7 +298,8 @@ def test_smartkv_vs_int8_vs_fp16():
         print(f"\n{'-'*80}")
         print(f"Summary (ctx={ctx_len}):")
         print(f"  SmartKV vs INT8 speedup:    {int8_latency/smartkv_latency:.2f}x")
-        print(f"  SmartKV vs FP16 speedup:    {fp16_latency/smartkv_latency:.2f}x")
+        if not float('nan') == fp16_latency:
+            print(f"  SmartKV vs FP16 speedup:    {fp16_latency/smartkv_latency:.2f}x")
         print(f"  SmartKV memory savings:     {(1.0-smartkv_memory_ratio)*100:.1f}% vs FP16")
         print(f"  SmartKV memory savings:     {(0.5-smartkv_memory_ratio)/0.5*100:.1f}% vs INT8")
         print(f"{'-'*80}")
@@ -315,15 +338,22 @@ def test_smartkv_vs_int8_vs_fp16():
     print("="*80)
     print()
 
-    # Calculate average speedups
+    # Calculate average speedups (excluding NaN values for FP16)
     avg_smartkv_vs_int8 = sum(r['int8_latency_ms']/r['smartkv_latency_ms'] for r in all_results) / len(all_results)
-    avg_smartkv_vs_fp16 = sum(r['fp16_latency_ms']/r['smartkv_latency_ms'] for r in all_results) / len(all_results)
+
+    valid_fp16_results = [r for r in all_results if not (r['fp16_latency_ms'] != r['fp16_latency_ms'])]  # Filter out NaN
+    if valid_fp16_results:
+        avg_smartkv_vs_fp16 = sum(r['fp16_latency_ms']/r['smartkv_latency_ms'] for r in valid_fp16_results) / len(valid_fp16_results)
+    else:
+        avg_smartkv_vs_fp16 = float('nan')
+
     avg_memory_savings_vs_fp16 = sum((1.0-r['smartkv_memory_ratio'])*100 for r in all_results) / len(all_results)
     avg_memory_savings_vs_int8 = sum((0.5-r['smartkv_memory_ratio'])/0.5*100 for r in all_results) / len(all_results)
 
     print("Average across all context lengths:")
     print(f"  SmartKV vs INT8 speedup:     {avg_smartkv_vs_int8:.2f}x")
-    print(f"  SmartKV vs FP16 speedup:     {avg_smartkv_vs_fp16:.2f}x")
+    if not (avg_smartkv_vs_fp16 != avg_smartkv_vs_fp16):  # Check if not NaN
+        print(f"  SmartKV vs FP16 speedup:     {avg_smartkv_vs_fp16:.2f}x")
     print(f"  SmartKV memory savings:      {avg_memory_savings_vs_fp16:.1f}% vs FP16")
     print(f"  SmartKV memory savings:      {avg_memory_savings_vs_int8:.1f}% vs INT8")
     print("="*80)
