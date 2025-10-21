@@ -5,6 +5,7 @@ High-level Python interface for CUDA/Triton quantized attention kernels.
 Automatically selects best kernel based on hardware and context length.
 """
 
+import math
 import torch
 from typing import Optional, Tuple, Dict
 import warnings
@@ -149,21 +150,30 @@ def quantized_attention(
 
     use_cuda_kernel = use_cuda and CUDA_AVAILABLE and device.type == 'cuda'
 
+    chunk_size: Optional[int] = None
+
     if use_cuda_kernel:
         device_index = device.index if device.index is not None else torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device_index)
         shared_mem_bytes = (d + k_len + 32) * 4  # floats in shared memory
 
         # Check shared memory limit (attribute name varies by PyTorch version)
-        max_shared_mem = getattr(props, 'max_shared_memory_per_block',
-                                 getattr(props, 'max_shared_memory_per_block_optin',
-                                        getattr(props, 'total_shared_memory_per_block', 49152)))
+        max_shared_mem = getattr(
+            props,
+            'max_shared_memory_per_block',
+            getattr(
+                props,
+                'max_shared_memory_per_block_optin',
+                getattr(props, 'total_shared_memory_per_block', 49152)
+            )
+        )
 
         if shared_mem_bytes > max_shared_mem:
+            chunk_size = max((max_shared_mem // 4) - d - 32, 1)
             warnings.warn(
                 f"SmartKV CUDA kernel requires {shared_mem_bytes} bytes shared memory "
                 f"but GPU only has {max_shared_mem} bytes per block. "
-                "Falling back to PyTorch attention.",
+                f"Using chunked attention fallback with chunk_size={chunk_size}.",
                 RuntimeWarning
             )
             use_cuda_kernel = False
@@ -176,6 +186,17 @@ def quantized_attention(
             value_int8.contiguous(),
             value_scale.contiguous(),
             attn_mask
+        )
+
+    if chunk_size is not None and chunk_size < k_len:
+        return _quantized_attention_chunked(
+            query,
+            key_int8,
+            key_scale,
+            value_int8,
+            value_scale,
+            attn_mask,
+            chunk_size=chunk_size
         )
 
     # PyTorch fallback (dequantize then standard attention)
@@ -414,9 +435,106 @@ def _quantized_attention_pytorch(
         scores = scores + attention_mask
 
     attn_weights = torch.softmax(scores, dim=-1)
+    if not torch.all(torch.isfinite(attn_weights)):
+        attn_weights = torch.where(
+            torch.isfinite(attn_weights),
+            attn_weights,
+            torch.zeros_like(attn_weights)
+        )
+
     output = torch.matmul(attn_weights, value)
 
     return output
+
+
+def _quantized_attention_chunked(
+    query: torch.Tensor,
+    key_int8: torch.Tensor,
+    key_scale: torch.Tensor,
+    value_int8: torch.Tensor,
+    value_scale: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    chunk_size: int = 1024,
+) -> torch.Tensor:
+    """Chunked PyTorch fallback that avoids materializing full attention."""
+
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    query = _ensure_query_layout(query)
+    device = query.device
+    batch, num_heads, q_len, head_dim = query.shape
+
+    key_int8 = _ensure_kv_layout(key_int8, num_heads, "key_int8")
+    value_int8 = _ensure_kv_layout(value_int8, num_heads, "value_int8")
+    _, _, k_len, _ = key_int8.shape
+    chunk_size = min(chunk_size, k_len)
+
+    key_scale = _ensure_scale_layout(key_scale, num_heads, k_len, "key_scale")
+    value_scale = _ensure_scale_layout(value_scale, num_heads, k_len, "value_scale")
+    attn_mask = _normalize_attention_mask(attention_mask, batch, q_len, k_len)
+
+    if chunk_size >= k_len:
+        return _quantized_attention_pytorch(query, key_int8, key_scale, value_int8, value_scale, attn_mask)
+
+    accum_dtype = torch.float32 if query.dtype in (torch.float16, torch.bfloat16) else query.dtype
+    query_accum = query.to(accum_dtype)
+
+    output = torch.zeros(batch, num_heads, q_len, head_dim, device=device, dtype=accum_dtype)
+    global_max = torch.full((batch, num_heads, q_len), float('-inf'), device=device, dtype=accum_dtype)
+    global_sum = torch.zeros((batch, num_heads, q_len), device=device, dtype=accum_dtype)
+
+    inv_sqrt_d = 1.0 / math.sqrt(head_dim)
+
+    for start in range(0, k_len, chunk_size):
+        end = min(start + chunk_size, k_len)
+
+        k_chunk = key_int8[:, :, start:end, :].to(device=device, dtype=accum_dtype)
+        ks_chunk = key_scale[:, :, start:end].to(device=device, dtype=accum_dtype).unsqueeze(-1)
+        v_chunk = value_int8[:, :, start:end, :].to(device=device, dtype=accum_dtype)
+        vs_chunk = value_scale[:, :, start:end].to(device=device, dtype=accum_dtype).unsqueeze(-1)
+
+        k_chunk = k_chunk * ks_chunk
+        v_chunk = v_chunk * vs_chunk
+
+        scores = torch.matmul(query_accum, k_chunk.transpose(-2, -1)) * inv_sqrt_d
+
+        if attn_mask is not None:
+            mask_chunk = attn_mask[..., start:end].to(device=device, dtype=accum_dtype)
+            scores = scores + mask_chunk
+
+        chunk_max = torch.amax(scores, dim=-1)
+        chunk_max = torch.where(torch.isfinite(chunk_max), chunk_max, torch.full_like(chunk_max, float('-inf')))
+
+        scores_shift = scores - chunk_max.unsqueeze(-1)
+        scores_shift = torch.where(torch.isfinite(scores), scores_shift, torch.full_like(scores_shift, float('-inf')))
+
+        chunk_exp = torch.exp(scores_shift)
+        chunk_sum = chunk_exp.sum(dim=-1)
+        weighted_chunk = torch.matmul(chunk_exp, v_chunk)
+
+        global_max_new = torch.maximum(global_max, chunk_max)
+
+        diff_prev = global_max - global_max_new
+        diff_prev = torch.where(torch.isfinite(diff_prev), diff_prev, torch.zeros_like(diff_prev))
+        scale_prev = torch.exp(diff_prev)
+        scale_prev = torch.where(torch.isfinite(global_max), scale_prev, torch.zeros_like(scale_prev))
+
+        diff_chunk = chunk_max - global_max_new
+        diff_chunk = torch.where(torch.isfinite(diff_chunk), diff_chunk, torch.zeros_like(diff_chunk))
+        scale_chunk = torch.exp(diff_chunk)
+        scale_chunk = torch.where(chunk_sum > 0, scale_chunk, torch.zeros_like(scale_chunk))
+
+        global_sum = global_sum * scale_prev + chunk_sum * scale_chunk
+        output = output * scale_prev.unsqueeze(-1) + weighted_chunk * scale_chunk.unsqueeze(-1)
+
+        global_max = global_max_new
+
+    safe_sum = torch.where(global_sum > 0, global_sum, torch.ones_like(global_sum))
+    output = output / safe_sum.unsqueeze(-1)
+    output = torch.where(global_sum.unsqueeze(-1) > 0, output, torch.zeros_like(output))
+
+    return output.to(query.dtype)
 
 
 def check_cuda_availability() -> Tuple[bool, str]:
