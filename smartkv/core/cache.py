@@ -9,7 +9,7 @@ import heapq
 import math
 from collections import deque
 import torch
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, Set
 import psutil
 import os
 
@@ -60,7 +60,10 @@ class SmartKVCache:
         importance_floor: float = 1e-6,
         hysteresis_rank_threshold: float = 0.05,
         hysteresis_intervals: int = 2,
-        use_bucketed_layout: bool = False
+        use_bucketed_layout: bool = False,
+        high_precision_fraction: float = 0.02,
+        high_precision_boost: float = 1.5,
+        min_high_precision_tokens: int = 0
     ):
         """
         Initialize SmartKV cache.
@@ -81,6 +84,9 @@ class SmartKVCache:
             hysteresis_rank_threshold: Minimum percentile rank change to consider reallocating a token
             hysteresis_intervals: Number of consecutive reallocations the threshold must be exceeded
             use_bucketed_layout: Enable experimental bucketed cache layout for GPU kernels
+            high_precision_fraction: Fraction of top-importance tokens to bias towards max precision
+            high_precision_boost: Multiplier applied to high-importance tokens when upgrading to max bits
+            min_high_precision_tokens: Minimum number of high-importance tokens to bias (overrides fraction if larger)
         """
         self.num_layers = num_layers
         self.num_heads = num_heads
@@ -172,6 +178,11 @@ class SmartKVCache:
         self.critical_token_window = 4
         self.critical_min_bits = max(self.available_bits)
         self.min_general_bits = min(self.available_bits)
+
+        # Bias for high-importance tokens
+        self.high_precision_fraction = float(max(0.0, min(high_precision_fraction, 0.5)))
+        self.high_precision_boost = float(max(1.0, high_precision_boost))
+        self.min_high_precision_tokens = int(max(0, min_high_precision_tokens))
         
         # Importance tracking
         self.importance_tracker = ImportanceTracker(
@@ -383,6 +394,27 @@ class SmartKVCache:
                 return float(bits)
             return float(math.pow(bits, utility_alpha))
 
+        # Identify high-importance tokens to bias towards max precision
+        high_priority_tokens: Set[int] = set()
+        if (self.high_precision_fraction > 0.0 or self.min_high_precision_tokens > 0) and tokens:
+            scored_tokens = []
+            for tid in tokens:
+                if tid in protected_set or tid < self.critical_token_window:
+                    continue
+                score = importance_scores.get(tid, 0.0)
+                if not math.isfinite(score) or score <= 0.0:
+                    continue
+                scored_tokens.append((tid, score))
+            if scored_tokens:
+                scored_tokens.sort(key=lambda item: item[1], reverse=True)
+                target_count = max(
+                    self.min_high_precision_tokens,
+                    int(math.ceil(len(scored_tokens) * self.high_precision_fraction))
+                )
+                target_count = min(len(scored_tokens), target_count)
+                if target_count > 0:
+                    high_priority_tokens = {tid for (tid, _score) in scored_tokens[:target_count]}
+
         # Compute rank percentiles for hysteresis thresholding
         ranked_tokens = sorted(
             (tid for tid in tokens if tid not in protected_set and tid >= self.critical_token_window),
@@ -428,6 +460,8 @@ class SmartKVCache:
                 if self.importance_floor <= 0.0:
                     return
                 importance = self.importance_floor
+            if token_id in high_priority_tokens and next_bits >= max_bits:
+                importance *= self.high_precision_boost
             state = self._rank_state.get(token_id)
             if state is not None and token_id in rank_percent:
                 enforce = compute_ratio(current_payload_bits) >= self.memory_budget * 0.85
