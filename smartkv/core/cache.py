@@ -413,7 +413,11 @@ class SmartKVCache:
                 )
                 target_count = min(len(scored_tokens), target_count)
                 if target_count > 0:
-                    high_priority_tokens = {tid for (tid, _score) in scored_tokens[:target_count]}
+                    if self.use_packing:
+                        high_priority_tokens = {tid for (tid, _score) in scored_tokens[:target_count]}
+                    else:
+                        # Without packing we cannot customize per-token payload precisely
+                        high_priority_tokens = set()
 
         # Compute rank percentiles for hysteresis thresholding
         ranked_tokens = sorted(
@@ -514,6 +518,77 @@ class SmartKVCache:
 
             if current_ratio >= self.memory_budget + tol:
                 break
+
+        if high_priority_tokens and self.use_packing:
+            max_bits = available_bits_desc[0]
+            sorted_priority = sorted(
+                high_priority_tokens,
+                key=lambda tid: importance_scores.get(tid, 0.0),
+                reverse=True
+            )
+            for tid in sorted_priority:
+                current_bits = allocation.get(tid, min_bits)
+                if current_bits >= max_bits:
+                    continue
+
+                target_bits = max_bits
+                delta_payload = float((target_bits - current_bits) * elements_per_token)
+                if delta_payload <= 0.0:
+                    allocation[tid] = target_bits
+                    continue
+
+                ratio_candidate = compute_ratio(current_payload_bits + delta_payload)
+                if ratio_candidate > self.memory_budget + tol:
+                    downgrade_candidates = sorted(
+                        (
+                            cid for cid in allocation.keys()
+                            if cid not in protected_set
+                            and cid not in high_priority_tokens
+                            and cid != tid
+                            and allocation.get(cid, min_bits) > min_bits
+                        ),
+                        key=lambda cid: importance_scores.get(cid, float('inf'))
+                    )
+                    restored: List[Tuple[int, int, int, float]] = []
+                    for cid in downgrade_candidates:
+                        current_c_bits = allocation.get(cid, min_bits)
+                        idx_c = bit_index.get(current_c_bits)
+                        if idx_c is None or idx_c <= 0:
+                            continue
+                        prev_bits = available_bits_asc[idx_c - 1]
+                        if prev_bits >= current_c_bits:
+                            continue
+                        reduce_payload = float((current_c_bits - prev_bits) * elements_per_token)
+                        allocation[cid] = prev_bits
+                        current_payload_bits -= reduce_payload
+                        restored.append((cid, current_c_bits, prev_bits, reduce_payload))
+                        ratio_candidate = compute_ratio(current_payload_bits + delta_payload)
+                        if ratio_candidate <= self.memory_budget + tol:
+                            break
+
+                    if ratio_candidate > self.memory_budget + tol:
+                        # Revert downgrades and skip upgrade for this token
+                        for cid, old_bits, new_bits, reduce_payload in reversed(restored):
+                            allocation[cid] = old_bits
+                            current_payload_bits += reduce_payload
+                        continue
+
+                    for cid, _old_bits, _new_bits, _reduce_payload in restored:
+                        state = self._rank_state.get(cid)
+                        if state is not None:
+                            state['streak'] = 0
+                            state['pct'] = rank_percent.get(cid, state.get('pct', 1.0))
+                            self._rank_state[cid] = state
+
+                allocation[tid] = target_bits
+                current_payload_bits += delta_payload
+                current_ratio = compute_ratio(current_payload_bits)
+
+                state = self._rank_state.get(tid)
+                if state is not None:
+                    state['streak'] = 0
+                    state['pct'] = rank_percent.get(tid, state.get('pct', 1.0))
+                    self._rank_state[tid] = state
 
         ratio, stats = self._allocation_stats(allocation)
         if hasattr(self, '_logger') and self._logger:

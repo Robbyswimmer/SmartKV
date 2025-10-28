@@ -64,6 +64,10 @@ def test_smartkv_vs_int8_vs_fp16():
             device='cuda',
             use_bucketed_layout=True,
             use_bit_packing=True,
+            utility_alpha=0.75,
+            high_precision_fraction=0.05,
+            high_precision_boost=3.0,
+            min_high_precision_tokens=128,
         )
 
         # ================================================================
