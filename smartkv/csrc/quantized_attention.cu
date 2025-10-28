@@ -14,6 +14,8 @@
 
 namespace {
 
+constexpr int LEGACY_TILE_SIZE = 128;
+
 // Warp-level reduction for max/sum
 __device__ __forceinline__ float warp_reduce_max(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -130,6 +132,7 @@ __device__ __forceinline__ int8_t unpack_value(const void* packed_ptr, int idx) 
 // Implements: output = softmax(Q @ K^T / sqrt(d)) @ V
 // With on-the-fly dequantization of K and V
 
+template<int TILE_SIZE>
 __global__ void quantized_attention_kernel_minimal(
     const float* __restrict__ query,
     const int8_t* __restrict__ key_int8,
@@ -149,12 +152,14 @@ __global__ void quantized_attention_kernel_minimal(
 
     // Shared memory layout:
     // [0..d-1]: query vector
-    // [d..d+k_len-1]: attention scores
-    // [d+k_len..d+k_len+31]: reduction scratch space
+    // [d..d+TILE_SIZE-1]: tile attention scores
+    // [d+TILE_SIZE..d+TILE_SIZE+31]: reduction scratch space
+    // [d+TILE_SIZE+32..d+TILE_SIZE+32+d-1]: output accumulator (unnormalized)
     extern __shared__ float shared_mem[];
     float* shared_query = shared_mem;
     float* shared_scores = shared_mem + d;
-    float* shared_scratch = shared_mem + d + k_len;
+    float* shared_scratch = shared_mem + d + TILE_SIZE;
+    float* output_acc = shared_mem + d + TILE_SIZE + 32;
 
     // Load query to shared memory
     for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
@@ -165,96 +170,123 @@ __global__ void quantized_attention_kernel_minimal(
 
     float inv_sqrt_d = 1.0f / sqrtf((float)d);
 
-    // Phase 1: Compute attention scores (Q @ K^T)
-    for (int k_pos = threadIdx.x; k_pos < k_len; k_pos += blockDim.x) {
-        float score = 0.0f;
+    // Initialize streaming softmax accumulators
+    float m = -FLT_MAX;
+    float s = 0.0f;
 
-        // Get scale for this key
-        int k_scale_offset = (b * H + h) * k_len + k_pos;
-        float k_scale_val = key_scale[k_scale_offset];
-
-        // Dot product with on-the-fly dequantization
-        for (int d_idx = 0; d_idx < d; d_idx++) {
-            float q_val = shared_query[d_idx];
-
-            int k_offset = ((b * H + h) * k_len + k_pos) * d + d_idx;
-            int8_t k_q_val = key_int8[k_offset];
-            float k_val = (float)k_q_val * k_scale_val;  // Fused dequantization
-
-            score += q_val * k_val;
-        }
-
-        score *= inv_sqrt_d;
-
-        // Apply attention mask if provided
-        if (attention_mask != nullptr) {
-            int mask_offset = ((b * 1 + 0) * q_len + q_pos) * k_len + k_pos;
-            score += attention_mask[mask_offset];
-        }
-
-        shared_scores[k_pos] = score;
-    }
-    __syncthreads();
-
-    // Phase 2: Numerically stable softmax
-    // Find max score for numerical stability
-    float max_score = -FLT_MAX;
-    for (int k_pos = threadIdx.x; k_pos < k_len; k_pos += blockDim.x) {
-        max_score = fmaxf(max_score, shared_scores[k_pos]);
-    }
-    max_score = block_reduce_max(max_score, shared_scratch);
-
-    // Broadcast max to all threads
-    if (threadIdx.x == 0) {
-        shared_scratch[0] = max_score;
-    }
-    __syncthreads();
-    max_score = shared_scratch[0];
-
-    // Compute exp(score - max) and sum
-    float exp_sum = 0.0f;
-    for (int k_pos = threadIdx.x; k_pos < k_len; k_pos += blockDim.x) {
-        float exp_score = expf(shared_scores[k_pos] - max_score);
-        shared_scores[k_pos] = exp_score;
-        exp_sum += exp_score;
-    }
-    exp_sum = block_reduce_sum(exp_sum, shared_scratch);
-
-    // Broadcast sum to all threads
-    if (threadIdx.x == 0) {
-        shared_scratch[0] = exp_sum;
-    }
-    __syncthreads();
-    exp_sum = shared_scratch[0];
-
-    // Normalize to get probabilities
-    for (int k_pos = threadIdx.x; k_pos < k_len; k_pos += blockDim.x) {
-        shared_scores[k_pos] /= exp_sum;
-    }
-    __syncthreads();
-
-    // Phase 3: Weighted sum of values (probs @ V)
+    // Initialize output accumulator
     for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
-        float output_val = 0.0f;
+        output_acc[d_idx] = 0.0f;
+    }
 
-        for (int k_pos = 0; k_pos < k_len; k_pos++) {
-            float prob = shared_scores[k_pos];
+    int head_offset = (b * H + h) * k_len;
+    const int8_t* key_head = key_int8 + (int64_t)head_offset * d;
+    const int8_t* value_head = value_int8 + (int64_t)head_offset * d;
+    const float* key_scale_head = key_scale + head_offset;
+    const float* value_scale_head = value_scale + head_offset;
 
-            // Get scale for this value
-            int v_scale_offset = (b * H + h) * k_len + k_pos;
-            float v_scale_val = value_scale[v_scale_offset];
+    int num_tiles = (k_len + TILE_SIZE - 1) / TILE_SIZE;
 
-            // Dequantize value and accumulate
-            int v_offset = ((b * H + h) * k_len + k_pos) * d + d_idx;
-            int8_t v_q_val = value_int8[v_offset];
-            float v_val = (float)v_q_val * v_scale_val;
+    for (int tile_idx = 0; tile_idx < num_tiles; ++tile_idx) {
+        int tile_start = tile_idx * TILE_SIZE;
+        int tile_end = min(tile_start + TILE_SIZE, k_len);
+        int tile_size = tile_end - tile_start;
 
-            output_val += prob * v_val;
+        __syncthreads();
+
+        // Phase 1: Compute attention scores for this tile
+        for (int local_k = threadIdx.x; local_k < tile_size; local_k += blockDim.x) {
+            int k_pos = tile_start + local_k;
+            float score = 0.0f;
+
+            float k_scale_val = key_scale_head[k_pos];
+            const int8_t* key_row = key_head + (int64_t)k_pos * d;
+
+            for (int d_idx = 0; d_idx < d; ++d_idx) {
+                float q_val = shared_query[d_idx];
+                float k_val = static_cast<float>(key_row[d_idx]) * k_scale_val;
+                score += q_val * k_val;
+            }
+
+            score *= inv_sqrt_d;
+
+            if (attention_mask != nullptr) {
+                int mask_offset = ((b * q_len) + q_pos) * k_len + k_pos;
+                score += attention_mask[mask_offset];
+            }
+
+            shared_scores[local_k] = score;
+        }
+        __syncthreads();
+
+        // Phase 2: Streaming softmax update
+        float tile_max = -FLT_MAX;
+        for (int local_k = threadIdx.x; local_k < tile_size; local_k += blockDim.x) {
+            tile_max = fmaxf(tile_max, shared_scores[local_k]);
+        }
+        tile_max = block_reduce_max(tile_max, shared_scratch);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            shared_scratch[0] = tile_max;
+        }
+        __syncthreads();
+        tile_max = shared_scratch[0];
+
+        float m_prev = m;
+        m = fmaxf(m, tile_max);
+        float rescale_factor = expf(m_prev - m);
+
+        for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
+            output_acc[d_idx] *= rescale_factor;
         }
 
-        // Write output
+        float tile_sum = 0.0f;
+        for (int local_k = threadIdx.x; local_k < tile_size; local_k += blockDim.x) {
+            float exp_score = expf(shared_scores[local_k] - m);
+            shared_scores[local_k] = exp_score;
+            tile_sum += exp_score;
+        }
+        tile_sum = block_reduce_sum(tile_sum, shared_scratch);
+        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            shared_scratch[0] = tile_sum;
+        }
+        __syncthreads();
+        tile_sum = shared_scratch[0];
+
+        s = s * rescale_factor + tile_sum;
+
+        __syncthreads();
+        for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
+            float acc = 0.0f;
+            for (int local_k = 0; local_k < tile_size; ++local_k) {
+                int k_pos = tile_start + local_k;
+                float prob = shared_scores[local_k];
+
+                float v_scale_val = value_scale_head[k_pos];
+                const int8_t* value_row = value_head + (int64_t)k_pos * d;
+                float v_val = static_cast<float>(value_row[d_idx]) * v_scale_val;
+                acc += prob * v_val;
+            }
+            output_acc[d_idx] += acc;
+        }
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        shared_scratch[0] = s;
+    }
+    __syncthreads();
+
+    float normalizer = shared_scratch[0];
+    normalizer = normalizer > 0.0f ? (1.0f / normalizer) : 0.0f;
+
+    for (int d_idx = threadIdx.x; d_idx < d; d_idx += blockDim.x) {
         int out_offset = ((b * H + h) * q_len + q_pos) * d + d_idx;
-        output[out_offset] = output_val;
+        output[out_offset] = output_acc[d_idx] * normalizer;
     }
 }
 
@@ -287,11 +319,11 @@ torch::Tensor quantized_attention_forward(
 
     // Kernel launch configuration
     dim3 grid(B, H, q_len);
-    int block_size = std::min(static_cast<int>(k_len), 256);
+    int block_size = std::min(256, std::max(32, ((static_cast<int>(k_len) + 31) / 32) * 32));
     dim3 block(block_size);
 
-    // Shared memory: query + scores + scratch
-    size_t shared_mem_size = (d + k_len + 32) * sizeof(float);
+    // Shared memory: query + tile scores + scratch + output accumulator
+    size_t shared_mem_size = (d + LEGACY_TILE_SIZE + 32 + d) * sizeof(float);
 
     // Get pointers
     const float* query_ptr = query.data_ptr<float>();
@@ -303,7 +335,7 @@ torch::Tensor quantized_attention_forward(
     float* output_ptr = output.data_ptr<float>();
 
     // Launch kernel
-    quantized_attention_kernel_minimal<<<grid, block, shared_mem_size>>>(
+    quantized_attention_kernel_minimal<LEGACY_TILE_SIZE><<<grid, block, shared_mem_size>>>(
         query_ptr,
         key_int8_ptr,
         key_scale_ptr,

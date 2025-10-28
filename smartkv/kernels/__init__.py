@@ -11,6 +11,8 @@ import warnings
 
 from smartkv.kernels.bit_packing import unpack_tensor
 
+LEGACY_TILE_SIZE = 128
+
 
 def _ensure_query_layout(query: torch.Tensor) -> torch.Tensor:
     """Ensure query has shape [B, H, q_len, d]."""
@@ -152,7 +154,7 @@ def quantized_attention(
     if use_cuda_kernel:
         device_index = device.index if device.index is not None else torch.cuda.current_device()
         props = torch.cuda.get_device_properties(device_index)
-        shared_mem_bytes = (d + k_len + 32) * 4  # floats in shared memory
+        shared_mem_bytes = (d + LEGACY_TILE_SIZE + 32 + d) * 4
 
         # Check shared memory limit (attribute name varies by PyTorch version)
         max_shared_mem = getattr(props, 'max_shared_memory_per_block',
