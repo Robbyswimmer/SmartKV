@@ -80,61 +80,61 @@ import smartkv_cuda
 print("Loaded smartkv_cuda from:", smartkv_cuda.__file__)
 PY
 
-# Experiment parameters (override via environment)
-MODEL_NAME=${MODEL_NAME:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+# Benchmark parameters (override via environment)
 CONTEXT_FILE=${CONTEXT_FILE:-data/romeo_juliet.txt}
 DEVICE=${DEVICE:-cuda}
-BUDGETS=${BUDGETS:-"0.50 0.35 0.25"}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-64}
-MAX_CONTEXT_TOKENS=${MAX_CONTEXT_TOKENS:-65536}
-OUTPUT_DIR=${OUTPUT_DIR:-results/long_context/${SLURM_JOB_ID}}
-USE_FUSED_CPU=${USE_FUSED_CPU:-0}
+MEMORY_BUDGET=${MEMORY_BUDGET:-0.25}
+CONTEXTS=${CONTEXTS:-"4096 8192 16384 32000 48000"}
+FP16_MAX=${FP16_MAX:-16384}
+INT8_MAX=${INT8_MAX:-32000}
+SMARTKV_MAX=${SMARTKV_MAX:-48000}
+WARMUP=${WARMUP:-10}
+ITERS=${ITERS:-80}
+OUTPUT_DIR=${OUTPUT_DIR:-results/real_context/${SLURM_JOB_ID}}
 
 mkdir -p "${OUTPUT_DIR}"
 
-echo "\n=== Long-context evaluation on Romeo and Juliet ==="
-echo "Model:        ${MODEL_NAME}"
+echo "\n=== Real-context SmartKV benchmark (Romeo & Juliet) ==="
 echo "Context file: ${CONTEXT_FILE}"
 echo "Device:       ${DEVICE}"
-echo "Budgets:      ${BUDGETS}"
 echo "Output dir:   ${OUTPUT_DIR}"
-echo "Max tokens:   ${MAX_NEW_TOKENS}"
-echo "Max context:  ${MAX_CONTEXT_TOKENS}"
-echo "Use fused CPU: ${USE_FUSED_CPU}"
+echo "Contexts:     ${CONTEXTS}"
+echo "FP16 max:     ${FP16_MAX}"
+echo "INT8 max:     ${INT8_MAX}"
+echo "SmartKV max:  ${SMARTKV_MAX}"
 
-IFS=' ' read -r -a BUDGET_ARR <<< "${BUDGETS}"
+IFS=' ' read -r -a CONTEXT_ARR <<< "${CONTEXTS}"
 
 CMD_ARGS=(
-  -m smartkv.experiments.long_context_test
-  --model "${MODEL_NAME}"
-  --context-file "${CONTEXT_FILE}"
+  scripts/bench_real_context.py
+  --document "${CONTEXT_FILE}"
   --device "${DEVICE}"
-  --output-dir "${OUTPUT_DIR}"
-  --max-tokens "${MAX_NEW_TOKENS}"
-  --max-context-tokens "${MAX_CONTEXT_TOKENS}"
+  --memory-budget "${MEMORY_BUDGET}"
+  --fp16-max "${FP16_MAX}"
+  --int8-max "${INT8_MAX}"
+  --smartkv-max "${SMARTKV_MAX}"
+  --warmup "${WARMUP}"
+  --iters "${ITERS}"
+  --output "${OUTPUT_DIR}/bench_results.json"
+  --contexts
 )
 
-if [[ "${USE_FUSED_CPU}" != "0" ]]; then
-  CMD_ARGS+=(--use-fused-cpu)
-fi
-
-CMD_ARGS+=(--budgets)
-for budget in "${BUDGET_ARR[@]}"; do
-  CMD_ARGS+=("${budget}")
+for ctx in "${CONTEXT_ARR[@]}"; do
+  CMD_ARGS+=("${ctx}")
 done
 
-echo "\nRunning long-context evaluation..."
+echo "\nRunning real-context benchmark..."
 python "${CMD_ARGS[@]}"
 STATUS=$?
 
 if [[ $STATUS -ne 0 ]]; then
-  echo "❌ Long-context evaluation failed with status ${STATUS}"
+  echo "❌ Benchmark failed with status ${STATUS}"
 else
-  echo "\n✅ Long-context evaluation completed successfully"
+  echo "\n✅ Benchmark completed successfully"
   echo "Results directory: ${OUTPUT_DIR}"
-  if [[ -f "${OUTPUT_DIR}/long_context_results.json" ]]; then
+  if [[ -f "${OUTPUT_DIR}/bench_results.json" ]]; then
     echo "Summary:"
-    cat "${OUTPUT_DIR}/long_context_results.json"
+    cat "${OUTPUT_DIR}/bench_results.json"
   fi
 fi
 
