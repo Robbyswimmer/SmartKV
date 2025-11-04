@@ -154,14 +154,10 @@ class SmartKVCache:
                 f"Requested budget {memory_budget:.4f} is below minimum achievable "
                 f"budget {self.min_budget:.4f} with current storage "
                 f"(INT8 + {self.scale_dtype.upper()} scales, packing={self.use_packing}). "
-                f"Clamping to minimum budget.",
+                f"Clamping to minimum budget {self.min_budget:.4f} to avoid overallocation.",
                 UserWarning
             )
-            if memory_budget < 0.5:
-                self.memory_budget = self.min_budget
-            else:
-                # Allow legacy 0.5 default while still warning
-                self.memory_budget = memory_budget
+            self.memory_budget = self.min_budget
         else:
             self.memory_budget = memory_budget
 
