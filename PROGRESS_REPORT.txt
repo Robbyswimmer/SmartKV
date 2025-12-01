@@ -1,0 +1,90 @@
+SmartKV Progress Report
+Robert Moseley
+Professor Jay Lim
+CS260: Seminar in Computer Science
+
+Introduction
+
+Large language models have become increasingly capable at handling long-context tasks, but this capability comes at a significant cost: memory. During inference, transformer models cache key-value pairs for every token processed, and this KV-cache quickly becomes the dominant memory bottleneck. For a model like Llama-2-7B processing 32,000 tokens, the KV-cache alone consumes over 32GB of memory at full FP16 precision. This memory wall limits both the maximum context length and batch sizes, directly impacting throughput and deployment costs.
+
+The research community has responded with various quantization techniques. Early work focused on uniform quantization schemes—applying INT8 or INT4 uniformly to all cached tokens. More recent methods like KIVI (per-channel quantization) and KVQuant (group-wise quantization) have pushed boundaries further, achieving 2-4× compression with minimal quality degradation. However, all existing approaches share a fundamental limitation: they treat all tokens equally, applying the same quantization scheme regardless of each token's actual importance to future computations.
+
+This is where SmartKV diverges from prior work. Rather than using static, uniform quantization, SmartKV leverages the model's own attention patterns to guide precision allocation. The key insight is that attention weights reveal which tokens the model actually relies on—and attention distributions are often highly skewed, with models focusing on a small subset of critical tokens. By tracking these importance patterns in real-time and dynamically allocating higher precision to high-attention tokens while aggressively quantizing low-attention tokens, SmartKV aims to achieve better accuracy-memory tradeoffs than uniform quantization methods.
+
+The core innovation is an adaptive precision allocation system that operates in three phases: (1) importance tracking via exponential moving averages of attention scores, (2) budget-constrained precision allocation using a marginal-gain priority algorithm, and (3) mixed-precision quantization with custom CUDA kernels. Unlike prior adaptive methods that rely on heuristics like token position, SmartKV uses the model's actual attention behavior as its guide.
+
+This report documents the progress made in implementing and evaluating SmartKV. The following sections detail the technical implementation, present early experimental results, highlight key technical achievements, and outline remaining work and future plans.
+
+Implementation Progress
+
+Over the past several weeks, SmartKV has made substantial progress across both its core algorithmic infrastructure and GPU-accelerated implementation.
+
+Core System
+
+At the foundation, I built a complete quantization pipeline supporting symmetric per-tensor quantization across 2-, 4-, and 8-bit precision modes. Each precision level uses per-head scale factors to maximize numerical range. On top of this, I developed an attention importance tracking system that maintains running statistics for each token using exponential moving average (EMA) with decay factor γ=0.9 to smooth temporal fluctuations. At each generation step, per-token attention weights are aggregated across heads and layers, then blended into historical importance scores.
+
+The precision allocation algorithm implements a marginal-gain priority strategy. Given a memory budget β (expressed as a fraction of FP16 memory), the allocator iteratively upgrades tokens from minimum precision to higher levels based on their importance scores and utility gained per additional bit. Special positions—such as the first few prompt tokens and most recent tokens—are protected at maximum precision to preserve coherence. All of these components integrate into a custom SmartKVCache class that manages the full lifecycle: tracking attention, triggering reallocation, quantizing new tokens, and dequantizing during attention computation.
+
+GPU Implementation
+
+On the GPU side, I implemented custom CUDA kernels for mixed-precision quantized attention. Instead of storing all tokens in a flat array, I re-architected the memory layout into a "bucketed" structure that physically groups tokens by their assigned bit-width. In this layout, tokens are organized into separate 2-bit, 4-bit, and 8-bit buckets. Each bucket stores its quantized values densely via bit-packing: 2-bit values pack 4 per byte, 4-bit values pack 2 per byte. During attention computation, the kernel processes each bucket separately with specialized paths, then combines results. This design improves cache locality and enables vectorized operations within each bucket.
+
+Benchmarking Infrastructure
+
+To enable reproducible evaluation, I constructed a benchmark suite using the Romeo and Juliet text corpus. The suite systematically tests multiple context lengths (4K, 8K, 16K, 32K, 48K tokens) across different memory budgets (β=0.25, 0.33, 0.40, 0.50). Baselines include FP16 baseline using PyTorch's SDPA, uniform INT8 quantization with both a legacy kernel and BitsAndBytes, and SmartKV adaptive quantization. The benchmark measures latency (averaged over 80 iterations with 10 warmup steps), memory usage, and precision distributions to validate that the allocator makes sensible decisions.
+
+Early Results
+
+Initial benchmarking has yielded several encouraging findings that validate the core SmartKV approach.
+
+SmartKV successfully processes contexts up to 48,000 tokens without numerical instability. At a 25% memory budget (β=0.25) with a 32K token context, SmartKV typically allocates 8-bit precision to approximately 5-10% of tokens (highest cumulative attention), 4-bit precision to around 20-30% of tokens (moderate importance), and 2-bit precision to the remaining 60-75% of tokens (low attention). This highly non-uniform distribution confirms the central hypothesis: attention patterns in language models are far from uniform, and there exists substantial headroom for adaptive precision allocation.
+
+Comparing SmartKV against uniform INT8 reveals interesting tradeoffs. At equivalent memory budgets, SmartKV's adaptive allocation provides more granular control. For example, SmartKV at β=0.30 can achieve similar effective precision to INT8 at 50% memory by concentrating bits where they matter most. The custom bucketed kernel introduces minimal computational overhead—typically under 5% compared to the flat-layout baseline—thanks to improved cache locality.
+
+At β=0.25, SmartKV achieves approximately 4× reduction in memory usage compared to FP16. Measured memory ratios including all metadata average around 0.26-0.28×, closely matching theoretical predictions. This level of compression significantly extends the maximum context length that can fit in GPU memory.
+
+Perhaps most critically, early qualitative accuracy tests suggest SmartKV preserves semantic fidelity. On a small Romeo & Juliet question-answering benchmark with 300-token contexts, SmartKV at β=0.40 produces outputs that match the FP16 baseline: correctly answering "Verona, Italy" and "Mercutio kills Tybalt". The latency overhead is minimal—1.6% on average. While these are anecdotal results on a small benchmark, they provide initial evidence that the quantization scheme maintains reasoning quality even at reduced precision.
+
+Technical Achievements
+
+Several technical milestones enabled SmartKV's current functionality:
+
+1. Bucketed Memory Layout – Reorganizing the cache by bit-width allows vectorized operations and reduces random memory access patterns during attention computation.
+
+2. Bit-Packing Implementation – Efficiently storing sub-8-bit values with specialized pack/unpack routines maximizes memory density while maintaining reasonable dequantization throughput.
+
+3. Scalable Importance Tracking – The EMA-based system maintains per-token importance across layers without materializing full attention tensors, keeping memory overhead tractable even for long contexts.
+
+4. CUDA Kernel Integration – Custom kernels that natively operate on mixed-precision caches eliminate the need for expensive on-the-fly conversion to uniform precision.
+
+Future Plans
+
+The remaining 2-3 weeks of the project will focus on rigorous evaluation and comparative benchmarking to position SmartKV within the broader landscape of KV-cache compression methods.
+
+Immediate Priorities (Next 2 Weeks)
+
+1. Perplexity Evaluation: Run comprehensive perplexity measurements on WikiText-103 to provide quantitative metrics on quality degradation at various memory budgets. I will measure perplexity for FP16, INT8, INT4, and SmartKV at β=0.25, 0.33, 0.50 to construct accuracy-memory curves.
+
+2. Long-Context Benchmarks: Evaluate on established long-context tasks including Needle-in-a-Haystack (test whether SmartKV can retrieve specific information embedded at various depths in 1K-16K token contexts) and RULER benchmark. I expect SmartKV to excel at needle tasks by allocating high precision to tokens that receive attention spikes.
+
+3. Baseline Comparisons: Implement and benchmark against KIVI (per-channel quantization) to compare SmartKV's adaptive approach against state-of-the-art uniform methods. This comparison is critical to demonstrate whether attention-guided allocation provides meaningful improvements.
+
+4. Ablation Studies: Conduct ablations to validate design choices—compare adaptive vs. random allocation to isolate the benefit of attention tracking, test different EMA decay factors (γ=0.85, 0.90, 0.95), and measure the impact of different reallocation frequencies.
+
+Stretch Goals (If Time Permits)
+
+- Integration with FlashAttention to eliminate overhead of separate tracking passes
+- Test on Mistral-7B or Phi-2 to demonstrate generalization beyond Llama
+- Derive regret bounds for the greedy allocation algorithm relative to offline optimal allocation
+
+Known Limitations and Risks
+
+The current implementation is CUDA-only with no CPU fallback, limiting portability. Perplexity evaluation on large corpora may be time-consuming and require substantial GPU hours. If perplexity results show significant degradation, I may need to adjust the quantization scheme or allocation strategy, potentially requiring additional implementation time. Overall, the project is on track to deliver a complete evaluation and validate whether attention-guided adaptive precision offers advantages over uniform quantization.
+
+Conclusion
+
+SmartKV has reached a significant developmental milestone: a fully functional adaptive quantization pipeline with custom GPU acceleration capable of handling contexts up to 48,000 tokens. The combination of attention-guided importance tracking, marginal-gain precision allocation, and bucketed memory layouts with bit-packing has created robust infrastructure for memory-efficient long-context inference.
+
+Early results confirm the viability of the core approach—the model's own attention patterns are sufficiently non-uniform to enable meaningful precision differentiation, and adaptive allocation can concentrate precision where it matters most. Qualitative tests show preserved reasoning quality, and measured memory reductions match theoretical predictions.
+
+The upcoming evaluation phase will rigorously quantify SmartKV's position on the accuracy-memory Pareto frontier through perplexity measurements, long-context retrieval benchmarks, and comparisons against state-of-the-art baselines. These results will determine whether attention-guided adaptive precision represents a meaningful advance over existing uniform quantization methods. Either outcome will contribute valuable insights to the broader conversation about efficient inference for large language models.

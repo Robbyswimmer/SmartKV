@@ -85,12 +85,14 @@ CONTEXT_FILE=${CONTEXT_FILE:-data/romeo_juliet.txt}
 DEVICE=${DEVICE:-cuda}
 MEMORY_BUDGET=${MEMORY_BUDGET:-0.25}
 CONTEXTS=${CONTEXTS:-"4096 8192 16384 32000 48000"}
-FP16_MAX=${FP16_MAX:-16384}
+FP_MAX=${FP_MAX:-16384}
 INT8_MAX=${INT8_MAX:-32000}
 SMARTKV_MAX=${SMARTKV_MAX:-48000}
 WARMUP=${WARMUP:-10}
 ITERS=${ITERS:-80}
 OUTPUT_DIR=${OUTPUT_DIR:-results/real_context/${SLURM_JOB_ID}}
+FP_BACKEND=${FP_BACKEND:-sdpa}
+INT8_BACKEND=${INT8_BACKEND:-legacy}
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -99,7 +101,9 @@ echo "Context file: ${CONTEXT_FILE}"
 echo "Device:       ${DEVICE}"
 echo "Output dir:   ${OUTPUT_DIR}"
 echo "Contexts:     ${CONTEXTS}"
-echo "FP16 max:     ${FP16_MAX}"
+echo "FP backend:   ${FP_BACKEND}"
+echo "INT8 backend: ${INT8_BACKEND}"
+echo "FP max:       ${FP_MAX}"
 echo "INT8 max:     ${INT8_MAX}"
 echo "SmartKV max:  ${SMARTKV_MAX}"
 
@@ -110,12 +114,14 @@ CMD_ARGS=(
   --document "${CONTEXT_FILE}"
   --device "${DEVICE}"
   --memory-budget "${MEMORY_BUDGET}"
-  --fp16-max "${FP16_MAX}"
+  --fp-max "${FP_MAX}"
   --int8-max "${INT8_MAX}"
   --smartkv-max "${SMARTKV_MAX}"
   --warmup "${WARMUP}"
   --iters "${ITERS}"
   --output "${OUTPUT_DIR}/bench_results.json"
+  --fp-backend "${FP_BACKEND}"
+  --int8-backend "${INT8_BACKEND}"
   --contexts
 )
 
