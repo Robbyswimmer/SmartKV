@@ -99,9 +99,11 @@ def evaluate_perplexity_blocks(
     device: torch.device,
     reset_cache_fn=None,
     desc: str = "",
+    stepwise: bool = False,
 ) -> Tuple[float, float, int, float]:
     """
-    Evaluate perplexity over pre-tokenized blocks.
+    Evaluate perplexity over pre-tokenized blocks using autoregressive stepping
+    (q_len = 1) to exercise fused quantized attention paths.
 
     Returns:
         perplexity, avg_loss, total_tokens, wall_clock_s
@@ -112,18 +114,32 @@ def evaluate_perplexity_blocks(
     start = time.perf_counter()
 
     for block in blocks:
-        input_ids = block.unsqueeze(0).to(device)
+        input_ids = block.to(device)
+        seq_len = input_ids.size(0)
         if reset_cache_fn is not None:
             reset_cache_fn()
 
-        with torch.no_grad():
-            outputs = model(input_ids, labels=input_ids)
-            loss = outputs.loss
+        if stepwise:
+            # Teacher-forced token-by-token loop (q_len=1) to engage fused quantized path
+            for t in range(1, seq_len):
+                ctx = input_ids[:t].unsqueeze(0)  # [1, t]
+                target = input_ids[: t + 1].unsqueeze(0)  # shift by one
+                with torch.no_grad():
+                    outputs = model(ctx, labels=target)
+                    loss = outputs.loss
 
-        # labels are shifted internally; number of predictions = seq_len - 1
-        tokens = input_ids.size(1) - 1
-        total_loss += loss.item() * tokens
-        total_tokens += tokens
+                tokens = 1
+                total_loss += loss.item() * tokens
+                total_tokens += tokens
+        else:
+            # Batched block evaluation (may bypass fused path when q_len>1)
+            input_ids_batched = input_ids.unsqueeze(0)
+            with torch.no_grad():
+                outputs = model(input_ids_batched, labels=input_ids_batched)
+                loss = outputs.loss
+            tokens = seq_len - 1
+            total_loss += loss.item() * tokens
+            total_tokens += tokens
 
     wall_clock_s = time.perf_counter() - start
     avg_loss = total_loss / max(total_tokens, 1)
@@ -139,6 +155,7 @@ def run_smartkv_perplexity(
     budgets: List[float],
     args: argparse.Namespace,
     logger,
+    stepwise: bool,
 ) -> List[RunResult]:
     """Evaluate SmartKV at multiple budgets using a single wrapped model."""
     results: List[RunResult] = []
@@ -167,7 +184,12 @@ def run_smartkv_perplexity(
         reset_cache()
 
         ppl, avg_loss, tokens, wall = evaluate_perplexity_blocks(
-            smartkv_model, blocks, device, reset_cache_fn=reset_cache, desc=f"smartkv_{budget}"
+            smartkv_model,
+            blocks,
+            device,
+            reset_cache_fn=reset_cache,
+            desc=f"smartkv_{budget}",
+            stepwise=stepwise,
         )
 
         memory_ratio = None
@@ -217,6 +239,11 @@ def main():
     parser.add_argument("--realloc-freq", type=int, default=16)
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--output-dir", type=str, default="results/wikitext_perplexity")
+    parser.add_argument(
+        "--stepwise",
+        action="store_true",
+        help="Evaluate token-by-token (q_len=1) to engage fused quantized path; slower but validates quantized attention.",
+    )
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -264,7 +291,12 @@ def main():
         return None
 
     ppl, avg_loss, tokens, wall = evaluate_perplexity_blocks(
-        base_model, blocks, device, reset_cache_fn=reset_noop, desc="baseline"
+        base_model,
+        blocks,
+        device,
+        reset_cache_fn=reset_noop,
+        desc="baseline",
+        stepwise=args.stepwise,
     )
     tps = tokens / wall if wall > 0 else 0.0
     results.append(
@@ -288,6 +320,7 @@ def main():
             budgets=args.budgets,
             args=args,
             logger=logger,
+            stepwise=args.stepwise,
         )
     )
 

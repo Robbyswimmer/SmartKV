@@ -14,7 +14,7 @@ set -eo pipefail
 MODEL=${MODEL:-NousResearch/Meta-Llama-3.1-8B}
 OUTPUT_DIR=${OUTPUT_DIR:-results/wikitext2_perplexity_llama3_gpu}
 BLOCK_SIZE=${BLOCK_SIZE:-512}
-MAX_EVAL_TOKENS=${MAX_EVAL_TOKENS:-8192}
+MAX_EVAL_TOKENS=${MAX_EVAL_TOKENS:-16384}
 BUDGETS=${BUDGETS:-"0.35 0.5 0.7"}
 DEVICE=${DEVICE:-cuda}
 CONDA_ENV=${CONDA_ENV:-smartkv}
