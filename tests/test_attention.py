@@ -8,6 +8,7 @@ SmartKV cache enabled (backward compatibility).
 import torch
 import pytest
 from smartkv.models.attention import SmartKVAttention, MultiQueryAttention
+from smartkv.kernels import _quantized_attention_chunked, _quantized_attention_pytorch
 
 
 class TestSmartKVAttentionBasic:
@@ -512,6 +513,61 @@ class TestIntegration:
         # Check cache has data from all layers
         stats = shared_cache.get_memory_stats()
         assert stats['num_cache_entries'] > 0
+
+
+class TestQuantizedAttentionFallbacks:
+    """Tests for chunked quantized attention fallback."""
+
+    def test_chunked_matches_pytorch_reference(self):
+        """Chunked fallback should match full PyTorch attention."""
+        torch.manual_seed(1234)
+
+        batch, heads, q_len, k_len, head_dim = 1, 3, 2, 97, 16
+        query = torch.randn(batch, heads, q_len, head_dim)
+        key_int8 = torch.randint(-128, 127, (batch, heads, k_len, head_dim), dtype=torch.int8)
+        value_int8 = torch.randint(-128, 127, (batch, heads, k_len, head_dim), dtype=torch.int8)
+        key_scale = torch.rand(batch, heads, k_len) + 0.5
+        value_scale = torch.rand(batch, heads, k_len) + 0.5
+
+        attention_mask = torch.zeros(batch, 1, q_len, k_len)
+        attention_mask[..., 40:] = float('-inf')
+
+        reference = _quantized_attention_pytorch(
+            query, key_int8, key_scale, value_int8, value_scale, attention_mask
+        )
+        chunked = _quantized_attention_chunked(
+            query, key_int8, key_scale, value_int8, value_scale, attention_mask, chunk_size=17
+        )
+
+        assert torch.allclose(reference, chunked, rtol=1e-4, atol=1e-5)
+
+    def test_chunked_handles_fully_masked_positions(self):
+        """Chunked fallback should gracefully handle fully masked queries."""
+        batch, heads, q_len, k_len, head_dim = 1, 2, 3, 65, 32
+        query = torch.randn(batch, heads, q_len, head_dim)
+        key_int8 = torch.randint(-128, 127, (batch, heads, k_len, head_dim), dtype=torch.int8)
+        value_int8 = torch.randint(-128, 127, (batch, heads, k_len, head_dim), dtype=torch.int8)
+        key_scale = torch.rand(batch, heads, k_len) + 0.25
+        value_scale = torch.rand(batch, heads, k_len) + 0.25
+
+        attention_mask = torch.zeros(batch, 1, q_len, k_len)
+        attention_mask[:] = float('-inf')
+        # Allow the first 10 keys for the first query to ensure mix of masked/unmasked
+        attention_mask[:, :, 0, :10] = 0.0
+
+        reference = _quantized_attention_pytorch(
+            query, key_int8, key_scale, value_int8, value_scale, attention_mask
+        )
+        chunked = _quantized_attention_chunked(
+            query, key_int8, key_scale, value_int8, value_scale, attention_mask, chunk_size=23
+        )
+
+        assert torch.allclose(reference, chunked, rtol=1e-4, atol=1e-5)
+        # Fully masked queries should produce zeros (matching reference)
+        masked_rows = attention_mask.squeeze(1).eq(float('-inf')).all(dim=-1)
+        masked_positions = masked_rows.squeeze(0)
+        assert torch.all(reference[:, :, masked_positions, :] == 0)
+        assert torch.all(chunked[:, :, masked_positions, :] == 0)
 
 
 if __name__ == "__main__":
